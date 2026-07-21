@@ -10,8 +10,9 @@ family of terminal games.
 The mixer provides pitch-shifted one-shots with voice stealing, held loops
 with live volume/pitch control, a crossfading two-slot music layer, a
 generator callback for live synthesis, a strict diagnostic WAV loader, and
-an offline mode for tests and bounce-to-disk rendering. It requires POSIX
-and pthreads; there are no other dependencies.
+an ownership-aware cue/variant bank, and an offline mode for tests and
+bounce-to-disk rendering. It requires POSIX and pthreads; there are no other
+dependencies.
 
 ## Build and test
 
@@ -57,6 +58,32 @@ pcmmix_music_stop(&mixer, 2.0f);
 pcmmix_stop(&mixer);
 pcmmix_wav_free(pcm);   /* samples are caller-owned; free after stop */
 ```
+
+## Cue and variant bank
+
+`pcmmix_bank` replaces the sample arrays, WAV ownership loops, and random
+variant selection that games otherwise repeat. It stores up to 64 cues with
+eight variants each, can borrow generated PCM or own loaded/allocated PCM,
+avoids immediate random repeats, and applies per-variant gain and pitch.
+
+```c
+#include "pcmmix_bank.h"
+
+pcmmix_bank bank;
+pcmmix_bank_init(&bank, SFX_COUNT, 0x1234u);
+pcmmix_bank_load_variants(&bank, SFX_HIT, hit_paths, hit_path_count,
+                          0.8f, 1.0f, error, sizeof error);
+pcmmix_bank_play(&mixer, &bank, SFX_HIT, 1.0f, 1.0f);
+
+pcmmix_stop(&mixer);   /* no voice may still reference bank memory */
+pcmmix_bank_clear(&bank);
+```
+
+Variant loading is transactional: if any path fails, the cue's previous
+samples remain intact. `pcmmix_bank_take()` transfers a malloc-compatible
+generated buffer only on success; `pcmmix_bank_set_borrowed()` leaves
+ownership with the caller. Bank mutation and cleanup are control-thread
+operations and must not race playback or precede mixer shutdown.
 
 ## Transport
 
@@ -173,8 +200,8 @@ make install PREFIX=/usr/local
 ```
 
 The build produces static and shared libraries. Applications may instead
-compile `src/pcm_mixer.c` and `src/pcm_wav.c` directly. The library has no
-dependencies beyond the C and POSIX system libraries.
+compile `src/pcm_mixer.c`, `src/pcm_wav.c`, and `src/pcmmix_bank.c` directly.
+The library has no dependencies beyond the C and POSIX system libraries.
 
 The API is pre-1.0 and may change between minor releases.
 
