@@ -6,12 +6,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <math.h>
+#include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -20,21 +22,34 @@ enum { CHUNK_CAP = 1024 };
 
 /* Voice handles are generation * PCMMIX_VOICES_MAX + slot; the generation
  * counter wraps below INT_MAX / PCMMIX_VOICES_MAX so handles stay > 0. */
-#define GENERATION_MAX 0x3FFFFFu
+#define GENERATION_MAX ((uint32_t)INT_MAX / PCMMIX_VOICES_MAX - 1u)
 #define SAMPLE_FRAMES_MAX (1u << 24) /* float resampler precision bound */
 #define MUSIC_FADE_SECONDS 0.5f
 #define SINK_PROBE_MS 80
-#define SINK_STALL_LIMIT 50 /* x 100 ms select timeout = ~5 s wedged */
+#define SINK_POLL_MS 100
+#define SINK_STALL_MS 5000
+
+extern char **environ;
 
 static float clampf(float v, float lo, float hi)
 {
+    if (isnan(v)) return 0.0f;
     return v < lo ? lo : v > hi ? hi : v;
 }
 
 static float sanitize_pitch(float pitch)
 {
-    if (pitch <= 0.0f) return 1.0f;
+    if (!isfinite(pitch) || pitch <= 0.0f) return 1.0f;
     return clampf(pitch, 1.0f / 32.0f, 32.0f);
+}
+
+static uint64_t monotonic_milliseconds(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0u;
+    return (uint64_t)now.tv_sec * UINT64_C(1000) +
+           (uint64_t)now.tv_nsec / UINT64_C(1000000);
 }
 
 static void sleep_msec(long milliseconds)
@@ -46,6 +61,38 @@ static void sleep_msec(long milliseconds)
 
 /* --- mixing (mixer lock held) ---------------------------------------- */
 
+static void mix_voice_unity(pcmmix_voice *v, float *mix, size_t frames)
+{
+    const size_t count = v->frame_count;
+    const float scale = v->vol * (1.0f / 32768.0f);
+    size_t source = (size_t)v->pos;
+    size_t output = 0u;
+
+    while (output < frames) {
+        size_t available;
+        size_t take;
+
+        if (source >= count) {
+            if (!v->looping) {
+                v->active = false;
+                break;
+            }
+            source = 0u;
+        }
+        available = count - source;
+        take = frames - output;
+        if (take > available) take = available;
+        for (size_t index = 0u; index < take; ++index) {
+            mix[output + index] += (float)v->data[source + index] * scale;
+        }
+        source += take;
+        output += take;
+    }
+    if (v->looping && source >= count) source = 0u;
+    v->pos = (float)source;
+    if (!v->looping && source >= count) v->active = false;
+}
+
 static void mix_voice(pcmmix_voice *v, float *mix, size_t frames)
 {
     if (!v->active) return;
@@ -55,6 +102,15 @@ static void mix_voice(pcmmix_voice *v, float *mix, size_t frames)
     }
     const size_t count = v->frame_count;
     const float length = (float)count;
+    if (!isfinite(v->pos) || !isfinite(v->step) || !isfinite(v->vol)) {
+        v->active = false;
+        return;
+    }
+    if (v->step == 1.0f && v->pos >= 0.0f &&
+        v->pos == floorf(v->pos)) {
+        mix_voice_unity(v, mix, frames);
+        return;
+    }
     for (size_t i = 0; i < frames; i++) {
         if (v->pos >= length) {
             if (!v->looping) {
@@ -73,6 +129,7 @@ static void mix_voice(pcmmix_voice *v, float *mix, size_t frames)
         mix[i] += (a + (b - a) * frac) * v->vol;
         v->pos += v->step;
     }
+    if (!v->looping && v->pos >= length) v->active = false;
 }
 
 static void mix_music(pcmmix_music_voice *mv, float *mix, size_t frames)
@@ -107,28 +164,53 @@ static void mix_music(pcmmix_music_voice *mv, float *mix, size_t frames)
         mix[i] += ((float)mv->data[ip] * (1.0f / 32768.0f)) * mv->vol;
         mv->pos += 1.0;
     }
+    if (!mv->looping && mv->pos >= (double)mv->frame_count)
+        mv->active = false;
+}
+
+static int16_t mix_to_s16(float sample)
+{
+    long rounded;
+
+    if (isnan(sample)) return 0;
+    if (sample > (float)INT16_MAX * (1.0f / 32768.0f)) return INT16_MAX;
+    if (sample <= -1.0f) return INT16_MIN;
+    rounded = lrintf(sample * 32768.0f);
+    return (int16_t)rounded;
 }
 
 static void mix_chunk_locked(pcmmix *m, int16_t *dst, size_t frames)
 {
     float mix[CHUNK_CAP];
+
+    if (!m->enabled) {
+        memset(dst, 0, frames * sizeof dst[0]);
+        return;
+    }
+    bool have_source = m->generator != NULL;
+    for (uint32_t index = 0u; index < m->max_voices && !have_source; ++index)
+        have_source = m->voices[index].active;
+    for (uint32_t index = 0u;
+         index < PCMMIX_MUSIC_SLOTS && !have_source; ++index)
+        have_source = m->music[index].active;
+    if (!have_source) {
+        memset(dst, 0, frames * sizeof dst[0]);
+        return;
+    }
     memset(mix, 0, frames * sizeof mix[0]);
-    if (m->enabled) {
-        for (uint32_t i = 0; i < m->max_voices; i++)
-            mix_voice(&m->voices[i], mix, frames);
-        for (uint32_t i = 0; i < PCMMIX_MUSIC_SLOTS; i++)
-            mix_music(&m->music[i], mix, frames);
-        if (m->generator) {
-            float gen[CHUNK_CAP];
-            memset(gen, 0, frames * sizeof gen[0]);
-            m->generator(gen, frames, m->generator_user);
-            for (size_t i = 0; i < frames; i++) mix[i] += gen[i];
-        }
+    for (uint32_t i = 0; i < m->max_voices; i++)
+        mix_voice(&m->voices[i], mix, frames);
+    for (uint32_t i = 0; i < PCMMIX_MUSIC_SLOTS; i++)
+        mix_music(&m->music[i], mix, frames);
+    if (m->generator) {
+        float gen[CHUNK_CAP];
+        memset(gen, 0, frames * sizeof gen[0]);
+        m->generator(gen, frames, m->generator_user);
+        for (size_t i = 0; i < frames; i++) mix[i] += gen[i];
     }
     for (size_t i = 0; i < frames; i++) {
-        float v = m->soft_clip ? tanhf(mix[i]) : mix[i];
-        v = clampf(v, -1.0f, 1.0f);
-        dst[i] = (int16_t)lrintf(v * 32767.0f);
+        const float sample = m->soft_clip ? tanhf(mix[i]) : mix[i];
+        dst[i] = mix_to_s16(sample);
     }
 }
 
@@ -140,25 +222,47 @@ static void silence_all_locked(pcmmix *m)
 
 /* --- sink discovery and transport ------------------------------------ */
 
-static bool in_path(const char *name)
+static bool set_close_on_exec(int descriptor)
 {
-    const char *path = getenv("PATH");
-    if (!path) return false;
-    char *copy = strdup(path);
-    if (!copy) return false;
-    bool found = false;
-    for (char *p = copy, *tok; (tok = strsep(&p, ":")) != NULL;) {
-        if (!*tok) tok = ".";
-        char full[512];
-        if (snprintf(full, sizeof full, "%s/%s", tok, name) <
-                (int)sizeof full &&
-            access(full, X_OK) == 0) {
-            found = true;
-            break;
-        }
+    const int flags = fcntl(descriptor, F_GETFD);
+
+    return flags >= 0 && fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
+static bool make_cloexec_pipe(int descriptors[2])
+{
+#if defined(__linux__) && defined(O_CLOEXEC)
+    if (pipe2(descriptors, O_CLOEXEC) == 0) return true;
+    if (errno != ENOSYS && errno != EINVAL) return false;
+#endif
+    if (pipe(descriptors) != 0) return false;
+    if (!set_close_on_exec(descriptors[0]) ||
+        !set_close_on_exec(descriptors[1])) {
+        (void)close(descriptors[0]);
+        (void)close(descriptors[1]);
+        return false;
     }
-    free(copy);
-    return found;
+    return true;
+}
+
+static bool move_above_stdio(int *descriptor)
+{
+    int duplicate;
+
+    if (*descriptor > STDERR_FILENO) return true;
+#ifdef F_DUPFD_CLOEXEC
+    duplicate = fcntl(*descriptor, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+#else
+    duplicate = fcntl(*descriptor, F_DUPFD, STDERR_FILENO + 1);
+    if (duplicate >= 0 && !set_close_on_exec(duplicate)) {
+        (void)close(duplicate);
+        duplicate = -1;
+    }
+#endif
+    if (duplicate < 0) return false;
+    (void)close(*descriptor);
+    *descriptor = duplicate;
+    return true;
 }
 
 /* Reap a sink that should be exiting; escalate if it will not. Returns
@@ -194,39 +298,79 @@ static void reap_sink(pcmmix *m)
     }
 }
 
-/* Fork the sink with a pipe dup2'd to its stdin, shrink the pipe so its
+/* Spawn the sink with a pipe dup2'd to its stdin, shrink the pipe so its
  * capacity is the transport latency, and give the child a short window to
  * prove it can stay alive (a sink with no server to talk to exits
  * immediately). Sink chatter on stdout/stderr is discarded so it cannot
  * land in the host's terminal UI. */
 static bool spawn_sink_argv(pcmmix *m, const char *const *argv)
 {
-    if (!argv || !argv[0]) return false;
-
+    posix_spawn_file_actions_t actions;
+    pid_t pid = -1;
+    int action_error;
+    int devnull;
+    int flags;
     int pfd[2];
-    if (pipe(pfd) != 0) return false;
+    bool actions_initialized;
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pfd[0]);
-        close(pfd[1]);
+    if (!argv || !argv[0]) return false;
+    if (!make_cloexec_pipe(pfd)) return false;
+    if (!move_above_stdio(&pfd[0]) || !move_above_stdio(&pfd[1])) {
+        (void)close(pfd[0]);
+        (void)close(pfd[1]);
         return false;
     }
-    if (pid == 0) {
-        dup2(pfd[0], STDIN_FILENO);
-        close(pfd[0]);
-        close(pfd[1]);
-        int nul = open("/dev/null", O_RDWR);
-        if (nul >= 0) {
-            dup2(nul, STDOUT_FILENO);
-            dup2(nul, STDERR_FILENO);
-            if (nul > STDERR_FILENO) close(nul);
-        }
-        execvp(argv[0], (char *const *)(uintptr_t)argv);
-        _exit(127);
+#ifdef O_CLOEXEC
+    devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+#else
+    devnull = open("/dev/null", O_RDWR);
+#endif
+    if (devnull < 0 || !move_above_stdio(&devnull) ||
+        !set_close_on_exec(devnull)) {
+        if (devnull >= 0) (void)close(devnull);
+        (void)close(pfd[0]);
+        (void)close(pfd[1]);
+        return false;
     }
-    close(pfd[0]);
-    (void)fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+    flags = fcntl(pfd[1], F_GETFL);
+    if (flags < 0 || fcntl(pfd[1], F_SETFL, flags | O_NONBLOCK) != 0) {
+        (void)close(devnull);
+        (void)close(pfd[0]);
+        (void)close(pfd[1]);
+        return false;
+    }
+
+    action_error = posix_spawn_file_actions_init(&actions);
+    actions_initialized = action_error == 0;
+    if (action_error == 0)
+        action_error = posix_spawn_file_actions_adddup2(
+            &actions, pfd[0], STDIN_FILENO);
+    if (action_error == 0)
+        action_error = posix_spawn_file_actions_adddup2(
+            &actions, devnull, STDOUT_FILENO);
+    if (action_error == 0)
+        action_error = posix_spawn_file_actions_adddup2(
+            &actions, devnull, STDERR_FILENO);
+    if (action_error == 0)
+        action_error = posix_spawn_file_actions_addclose(&actions, pfd[0]);
+    if (action_error == 0)
+        action_error = posix_spawn_file_actions_addclose(&actions, pfd[1]);
+    if (action_error == 0)
+        action_error = posix_spawn_file_actions_addclose(&actions, devnull);
+    if (action_error == 0) {
+        action_error = posix_spawnp(
+            &pid, argv[0], &actions, NULL,
+            (char *const *)(uintptr_t)argv, environ);
+    }
+    if (actions_initialized)
+        (void)posix_spawn_file_actions_destroy(&actions);
+    (void)close(devnull);
+    (void)close(pfd[0]);
+    if (action_error != 0) {
+        (void)close(pfd[1]);
+        errno = action_error;
+        return false;
+    }
 
     m->pipe_paced = false;
 #ifdef F_SETPIPE_SZ
@@ -245,9 +389,18 @@ static bool spawn_sink_argv(pcmmix *m, const char *const *argv)
 
     sleep_msec(SINK_PROBE_MS);
     int status;
-    pid_t r = waitpid(pid, &status, WNOHANG);
+    pid_t r;
+    do {
+        r = waitpid(pid, &status, WNOHANG);
+    } while (r < 0 && errno == EINTR);
     if (r == pid || (r < 0 && errno == ECHILD)) {
-        close(pfd[1]);
+        (void)close(pfd[1]);
+        return false;
+    }
+    if (r < 0) {
+        (void)close(pfd[1]);
+        (void)kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
         return false;
     }
 
@@ -282,7 +435,6 @@ static bool spawn_probe(pcmmix *m)
                                         play_argv };
 
     for (size_t i = 0; i < sizeof candidates / sizeof candidates[0]; i++) {
-        if (!in_path(candidates[i][0])) continue;
         if (spawn_sink_argv(m, candidates[i])) return true;
     }
     return false;
@@ -296,39 +448,57 @@ static bool still_running(pcmmix *m)
     return r;
 }
 
-/* Write one block to the sink. Blocking against the shrunken pipe is what
- * paces the mixer to the DAC clock; select() bounds each wait so shutdown
- * never hangs on a wedged sink. Returns false when the sink is gone. */
-static bool write_block(pcmmix *m, const int16_t *block, size_t bytes)
+/* Write one block to the sink. Readiness against the shrunken pipe paces the
+ * mixer to the sink clock. The descriptor stays nonblocking and an absolute
+ * no-progress deadline survives EINTR, so neither a large descriptor number,
+ * a signal storm, nor a partially writable pipe can defeat bounded shutdown. */
+static bool write_block(pcmmix *m, const void *block, size_t bytes)
 {
     const uint8_t *p = (const uint8_t *)block;
     size_t left = bytes;
-    int stalls = 0;
+    uint64_t deadline = monotonic_milliseconds() + SINK_STALL_MS;
+
     while (left > 0) {
         if (!still_running(m)) return true; /* shutting down: abandon */
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(m->sink_fd, &wfds);
-        struct timeval tv = { 0, 100 * 1000 };
-        int rc = select(m->sink_fd + 1, NULL, &wfds, NULL, &tv);
-        if (rc == 0) {
-            if (++stalls >= SINK_STALL_LIMIT) return false;
-            continue;
-        }
+        const uint64_t now = monotonic_milliseconds();
+        if (now >= deadline) return false;
+        uint64_t remaining = deadline - now;
+        int timeout = remaining < SINK_POLL_MS ? (int)remaining : SINK_POLL_MS;
+        struct pollfd sink = {m->sink_fd, POLLOUT, 0};
+        int rc = poll(&sink, 1u, timeout);
+
+        if (rc == 0) continue;
         if (rc < 0) {
             if (errno == EINTR) continue;
             return false;
         }
+        if ((sink.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) return false;
+        if ((sink.revents & POLLOUT) == 0) continue;
         ssize_t n = write(m->sink_fd, p, left);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
             return false;
         }
+        if (n == 0) return false;
         p += (size_t)n;
         left -= (size_t)n;
-        stalls = 0;
+        deadline = monotonic_milliseconds() + SINK_STALL_MS;
     }
     return true;
+}
+
+static bool write_pcm_block(pcmmix *m, const int16_t *block, size_t frames)
+{
+    uint8_t little_endian[CHUNK_CAP * sizeof block[0]];
+
+    for (size_t index = 0u; index < frames; ++index) {
+        const uint16_t sample = (uint16_t)block[index];
+
+        little_endian[index * 2u] = (uint8_t)(sample & UINT16_C(0xff));
+        little_endian[index * 2u + 1u] = (uint8_t)(sample >> 8);
+    }
+    return write_block(m, little_endian, frames * sizeof block[0]);
 }
 
 static bool sink_exited(pcmmix *m)
@@ -347,14 +517,13 @@ static bool sink_exited(pcmmix *m)
  * state where every API call is a safe no-op. */
 static void transport_fail(pcmmix *m)
 {
-    reap_sink(m);
     pthread_mutex_lock(&m->lock);
     m->sink_alive = false;
-    m->backend[0] = '\0';
     m->enabled = false;
     m->running = false;
     silence_all_locked(m);
     pthread_mutex_unlock(&m->lock);
+    reap_sink(m);
 }
 
 static void *mixer_thread_main(void *arg)
@@ -364,6 +533,13 @@ static void *mixer_thread_main(void *arg)
     const size_t frames = m->block_frames;
     const long block_ms =
         (long)((uint64_t)frames * 1000u / m->sample_rate) + 1;
+    sigset_t blocked;
+
+    if (sigemptyset(&blocked) != 0 || sigaddset(&blocked, SIGPIPE) != 0 ||
+        pthread_sigmask(SIG_BLOCK, &blocked, NULL) != 0) {
+        transport_fail(m);
+        return NULL;
+    }
 
     for (;;) {
         pthread_mutex_lock(&m->lock);
@@ -376,7 +552,7 @@ static void *mixer_thread_main(void *arg)
         mix_chunk_locked(m, out, frames);
         pthread_mutex_unlock(&m->lock);
 
-        if (!write_block(m, out, frames * sizeof out[0])) {
+        if (!write_pcm_block(m, out, frames)) {
             transport_fail(m);
             break;
         }
@@ -439,8 +615,6 @@ bool pcmmix_start(pcmmix *m, const pcmmix_options *options)
         return true;
     }
 
-    signal(SIGPIPE, SIG_IGN); /* sink death must not kill the host */
-
     bool spawned = options->sink_argv ? spawn_sink_argv(m, options->sink_argv)
                                       : spawn_probe(m);
     if (!spawned) {
@@ -501,7 +675,7 @@ void pcmmix_set_enabled(pcmmix *m, bool on)
 {
     if (!m || !m->started) return;
     pthread_mutex_lock(&m->lock);
-    m->enabled = on;
+    m->enabled = on && m->running;
     if (!on) silence_all_locked(m);
     pthread_mutex_unlock(&m->lock);
 }
@@ -684,7 +858,7 @@ void pcmmix_music_stop(pcmmix *m, float fade_seconds)
     for (uint32_t i = 0; i < PCMMIX_MUSIC_SLOTS; i++) {
         pcmmix_music_voice *mv = &m->music[i];
         if (!mv->active) continue;
-        if (fade_seconds <= 0.0f) {
+        if (!isfinite(fade_seconds) || fade_seconds <= 0.0f) {
             *mv = (pcmmix_music_voice){0};
         } else {
             mv->target = 0.0f;
@@ -721,7 +895,7 @@ void pcmmix_mix_block(pcmmix *m, int16_t *dst, size_t frames)
 {
     if (!m || !dst || frames == 0) return;
     if (frames > SIZE_MAX / sizeof(int16_t)) return;
-    if (!m->started) {
+    if (!m->started || !m->offline) {
         memset(dst, 0, frames * sizeof(int16_t));
         return;
     }

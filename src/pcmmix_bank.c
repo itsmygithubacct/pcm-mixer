@@ -1,8 +1,14 @@
 #include "pcmmix_bank.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+static void set_error(char *error, size_t error_size, const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
+#endif
 
 static void set_error(char *error, size_t error_size, const char *format, ...)
 {
@@ -16,7 +22,8 @@ static void set_error(char *error, size_t error_size, const char *format, ...)
 
 static bool cue_valid(const pcmmix_bank *bank, uint32_t cue)
 {
-    return bank != NULL && bank->cue_count != 0u && cue < bank->cue_count;
+    return bank != NULL && cue < bank->cue_count &&
+           bank->cue_count <= PCMMIX_BANK_CUES_MAX;
 }
 
 static bool slot_valid(const pcmmix_bank *bank, uint32_t cue,
@@ -27,12 +34,12 @@ static bool slot_valid(const pcmmix_bank *bank, uint32_t cue,
 
 static float normalized_gain(float gain)
 {
-    return gain < 0.0f ? 0.0f : gain;
+    return isnan(gain) || gain < 0.0f ? 0.0f : gain;
 }
 
 static float normalized_pitch(float pitch)
 {
-    return pitch > 0.0f ? pitch : 1.0f;
+    return !isnan(pitch) && pitch > 0.0f ? pitch : 1.0f;
 }
 
 static void release_variant(pcmmix_bank_variant *variant)
@@ -113,10 +120,48 @@ static bool set_variant(pcmmix_bank *bank, uint32_t cue, uint32_t variant,
     return true;
 }
 
+static pcmmix_bank_variant *find_owner(pcmmix_bank *bank,
+                                       const int16_t *frames)
+{
+    for (uint32_t cue = 0u; cue < bank->cue_count; ++cue) {
+        for (uint32_t variant = 0u; variant < PCMMIX_BANK_VARIANTS_MAX;
+             ++variant) {
+            pcmmix_bank_variant *candidate =
+                &bank->cues[cue].variants[variant];
+
+            if (candidate->occupied && candidate->owned_frames == frames)
+                return candidate;
+        }
+    }
+    return NULL;
+}
+
+static bool referenced_by_other_slot(const pcmmix_bank *bank,
+                                     const pcmmix_bank_variant *target,
+                                     const int16_t *frames)
+{
+    for (uint32_t cue = 0u; cue < bank->cue_count; ++cue) {
+        for (uint32_t variant = 0u; variant < PCMMIX_BANK_VARIANTS_MAX;
+             ++variant) {
+            const pcmmix_bank_variant *candidate =
+                &bank->cues[cue].variants[variant];
+
+            if (candidate != target && candidate->occupied &&
+                candidate->sample.frames == frames)
+                return true;
+        }
+    }
+    return false;
+}
+
 bool pcmmix_bank_set_borrowed(pcmmix_bank *bank, uint32_t cue,
                               uint32_t variant, const pcmmix_sample *sample,
                               float gain, float pitch)
 {
+    if (!slot_valid(bank, cue, variant) || sample == NULL ||
+        sample->frames == NULL || sample->frame_count == 0u ||
+        find_owner(bank, sample->frames) != NULL)
+        return false;
     return set_variant(bank, cue, variant, sample, NULL, gain, pitch);
 }
 
@@ -125,6 +170,31 @@ bool pcmmix_bank_take(pcmmix_bank *bank, uint32_t cue, uint32_t variant,
                       float pitch)
 {
     const pcmmix_sample sample = {frames, frame_count};
+    pcmmix_bank_variant *owner;
+    pcmmix_bank_variant *target;
+
+    if (!slot_valid(bank, cue, variant) || frames == NULL || frame_count == 0u)
+        return false;
+    target = &bank->cues[cue].variants[variant];
+    if (referenced_by_other_slot(bank, target, frames)) return false;
+    owner = find_owner(bank, frames);
+    if (owner != NULL) {
+        if (owner != target) return false;
+        target->sample = sample;
+        target->gain = normalized_gain(gain);
+        target->pitch = normalized_pitch(pitch);
+        target->occupied = true;
+        refresh_cue(&bank->cues[cue]);
+        return true;
+    }
+    if (target->occupied && target->sample.frames == frames) {
+        target->sample = sample;
+        target->owned_frames = frames;
+        target->gain = normalized_gain(gain);
+        target->pitch = normalized_pitch(pitch);
+        refresh_cue(&bank->cues[cue]);
+        return true;
+    }
 
     return set_variant(bank, cue, variant, &sample, frames, gain, pitch);
 }
@@ -245,8 +315,10 @@ int pcmmix_bank_choose(pcmmix_bank *bank, uint32_t cue)
         if (selected->variants[index].occupied) occupied[count++] = index;
     if (count == 0u) return -1;
     selection = (size_t)(next_random(bank) % (uint32_t)count);
-    if (count > 1u && occupied[selection] == selected->last_variant)
-        selection = (selection + 1u) % count;
+    if (count > 1u && occupied[selection] == selected->last_variant) {
+        ++selection;
+        if (selection == count) selection = 0u;
+    }
     selected->last_variant = occupied[selection];
     return (int)occupied[selection];
 }

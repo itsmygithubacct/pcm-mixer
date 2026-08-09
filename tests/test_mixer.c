@@ -3,11 +3,15 @@
 #include "pcm_mixer.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -48,6 +52,16 @@ sleep_ms(long milliseconds)
     struct timespec ts = { milliseconds / 1000,
                            (milliseconds % 1000) * 1000000L };
     while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+}
+
+static uint64_t
+monotonic_nanoseconds(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0u;
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)now.tv_nsec;
 }
 
 static void
@@ -236,6 +250,22 @@ test_wav_rejects_malformed(void)
     put_u32(image + 40, 0x00ffffffu); /* data chunk length field */
     CHECK(expect_wav_failure(image, image_len, "overruns"));
 
+    /* The RIFF form length is the authoritative parsing boundary. */
+    image_len = make_wav(image, frames, 8, 1u, 1u, 44100u, 16u, false);
+    put_u32(image + 4, 0u);
+    CHECK(expect_wav_failure(image, image_len, "RIFF size"));
+
+    /* PCM byte-rate and block alignment must agree with the format. */
+    image_len = make_wav(image, frames, 8, 1u, 1u, 44100u, 16u, false);
+    put_u32(image + 28, 0u);
+    put_u16(image + 32, 0u);
+    CHECK(expect_wav_failure(image, image_len, "rate/alignment"));
+
+    /* A 16-bit PCM data chunk cannot contain an odd byte count. */
+    image_len = make_wav(image, frames, 8, 1u, 1u, 44100u, 16u, false);
+    put_u32(image + 40, 15u);
+    CHECK(expect_wav_failure(image, image_len, "odd PCM"));
+
     /* fmt chunk but no data chunk. */
     image_len = make_wav(image, frames, 8, 1u, 1u, 44100u, 16u, false);
     memcpy(image + 36, "misc", 4); /* rename the data chunk id */
@@ -311,6 +341,58 @@ test_single_voice_reproduces_sample(void)
     CHECK(out[55] == 0); /* one-shot ended */
     CHECK(out[79] == 0);
 
+    pcmmix_stop(&mixer);
+    return true;
+}
+
+static bool
+test_full_scale_and_exact_completion(void)
+{
+    static const int16_t source[] = {
+        INT16_MIN, -1, 0, 1, INT16_MAX
+    };
+    const pcmmix_sample sample = {
+        source, sizeof source / sizeof source[0]
+    };
+    int16_t output[sizeof source / sizeof source[0]];
+    pcmmix mixer;
+
+    CHECK(start_offline(&mixer, 8000u, 4u, false));
+    const int voice = pcmmix_play(&mixer, &sample, 1.0f, 1.0f);
+    CHECK(voice > 0);
+    pcmmix_mix_block(&mixer, output, sizeof output / sizeof output[0]);
+    CHECK(memcmp(output, source, sizeof source) == 0);
+    CHECK(!pcmmix_voice_active(&mixer, voice));
+    pcmmix_music_play(&mixer, &sample, 1.0f, false);
+    CHECK(pcmmix_music_current(&mixer) == source);
+    pcmmix_mix_block(&mixer, output, sizeof output / sizeof output[0]);
+    CHECK(pcmmix_music_current(&mixer) == NULL);
+    pcmmix_stop(&mixer);
+    return true;
+}
+
+static bool
+test_transport_mix_block_is_silent(void)
+{
+    static const int16_t source[] = {12000, 8000, 4000, 2000};
+    const pcmmix_sample sample = {
+        source, sizeof source / sizeof source[0]
+    };
+    int16_t output[sizeof source / sizeof source[0]];
+    pcmmix mixer;
+
+    CHECK(start_offline(&mixer, 8000u, 4u, false));
+    CHECK(pcmmix_play(&mixer, &sample, 1.0f, 1.0f) > 0);
+    /* Exercise the transport guard without starting a sink thread, then
+     * restore offline mode to prove the rejected pull advanced no state. */
+    mixer.offline = false;
+    fill_const(output, sizeof output / sizeof output[0], INT16_MAX);
+    pcmmix_mix_block(&mixer, output, sizeof output / sizeof output[0]);
+    CHECK(output[0] == 0 && output[1] == 0 &&
+          output[2] == 0 && output[3] == 0);
+    mixer.offline = true;
+    pcmmix_mix_block(&mixer, output, sizeof output / sizeof output[0]);
+    CHECK(memcmp(output, source, sizeof source) == 0);
     pcmmix_stop(&mixer);
     return true;
 }
@@ -573,7 +655,199 @@ test_generator_mixed_under_voices(void)
     return true;
 }
 
+static void
+nonfinite_generator(float *dst, size_t frames, void *user)
+{
+    (void)user;
+    if (frames > 0u) dst[0] = NAN;
+    if (frames > 1u) dst[1] = INFINITY;
+    if (frames > 2u) dst[2] = -INFINITY;
+    if (frames > 3u) dst[3] = 0.25f;
+    if (frames > 4u) dst[4] = nextafterf(1.0f, 0.0f);
+    if (frames > 5u) dst[5] = nextafterf(-1.0f, 0.0f);
+}
+
+static bool
+test_nonfinite_controls_are_bounded(void)
+{
+    static const int16_t source[] = {1000, 2000, 3000, 4000};
+    const pcmmix_sample sample = {source, 4u};
+    int16_t output[8];
+    pcmmix mixer;
+
+    CHECK(start_offline(&mixer, 8000u, 4u, false));
+    CHECK(pcmmix_play(&mixer, &sample, NAN, NAN) > 0);
+    pcmmix_mix_block(&mixer, output, 4u);
+    CHECK(output[0] == 0 && output[1] == 0 && output[2] == 0 &&
+          output[3] == 0);
+
+    pcmmix_set_generator(&mixer, nonfinite_generator, NULL);
+    pcmmix_mix_block(&mixer, output, 6u);
+    CHECK(output[0] == 0);
+    CHECK(output[1] == INT16_MAX);
+    CHECK(output[2] == INT16_MIN);
+    CHECK_NEAR(output[3], 8192, 1);
+    CHECK(output[4] == INT16_MAX);
+    CHECK(output[5] == INT16_MIN);
+    pcmmix_set_generator(&mixer, NULL, NULL);
+
+    CHECK(pcmmix_play(&mixer, &sample, 1.0f, INFINITY) > 0);
+    pcmmix_mix_block(&mixer, output, 4u);
+    CHECK(output[0] == 1000 && output[1] == 2000 && output[2] == 3000 &&
+          output[3] == 4000);
+
+    pcmmix_music_play(&mixer, &sample, 1.0f, true);
+    pcmmix_music_stop(&mixer, NAN);
+    pcmmix_mix_block(&mixer, output, 4u);
+    CHECK(output[0] == 0 && pcmmix_music_current(&mixer) == NULL);
+    pcmmix_stop(&mixer);
+    return true;
+}
+
 /* --- transport ---------------------------------------------------------- */
+
+static void
+test_sigpipe_handler(int signal_number)
+{
+    (void)signal_number;
+}
+
+static bool
+test_sigpipe_disposition_is_preserved(void)
+{
+    const char *sink_argv[] = {"/bin/cat", NULL};
+    struct sigaction desired;
+    struct sigaction original;
+    struct sigaction observed;
+    pcmmix_options options;
+    pcmmix mixer;
+    bool started = false;
+    bool ok = false;
+
+    (void)memset(&desired, 0, sizeof desired);
+    desired.sa_handler = test_sigpipe_handler;
+    if (sigemptyset(&desired.sa_mask) != 0 ||
+        sigaction(SIGPIPE, &desired, &original) != 0)
+        return false;
+    pcmmix_options_init(&options);
+    options.sink_argv = sink_argv;
+    started = pcmmix_start(&mixer, &options);
+    if (started) pcmmix_stop(&mixer);
+    if (started && sigaction(SIGPIPE, NULL, &observed) == 0)
+        ok = observed.sa_handler == test_sigpipe_handler;
+    if (sigaction(SIGPIPE, &original, NULL) != 0) ok = false;
+    return ok;
+}
+
+static bool
+test_high_descriptor_transport(void)
+{
+    enum { HELD_CAPACITY = FD_SETSIZE + 64 };
+    const char *sink_argv[] = {"/bin/cat", NULL};
+    int held[HELD_CAPACITY];
+    size_t held_count = 0u;
+    pcmmix_options options;
+    pcmmix mixer;
+    bool started = false;
+    bool ok = false;
+
+    while (held_count < HELD_CAPACITY) {
+        const int descriptor = open("/dev/null", O_RDONLY | O_CLOEXEC);
+
+        if (descriptor < 0) break;
+        held[held_count++] = descriptor;
+        if (descriptor > FD_SETSIZE) break;
+    }
+    pcmmix_options_init(&options);
+    options.sink_argv = sink_argv;
+    if (held_count != 0u && held[held_count - 1u] > FD_SETSIZE) {
+        started = pcmmix_start(&mixer, &options);
+        if (started) {
+            sleep_ms(50);
+            ok = mixer.sink_fd > FD_SETSIZE && pcmmix_is_running(&mixer);
+            pcmmix_stop(&mixer);
+        }
+    }
+    for (size_t index = 0u; index < held_count; ++index)
+        if (close(held[index]) != 0) ok = false;
+    return started && ok;
+}
+
+static bool
+test_stalled_sink_has_bounded_stop(void)
+{
+    const char *sink_argv[] = {"/bin/sh", "-c", "exec sleep 30", NULL};
+    pcmmix_options options;
+    pcmmix mixer;
+    uint64_t started;
+    uint64_t elapsed;
+
+    pcmmix_options_init(&options);
+    options.sink_argv = sink_argv;
+    CHECK(pcmmix_start(&mixer, &options));
+    sleep_ms(200); /* fill the pipe and enter the readiness wait */
+    started = monotonic_nanoseconds();
+    pcmmix_stop(&mixer);
+    elapsed = monotonic_nanoseconds() - started;
+    CHECK(elapsed < UINT64_C(1500000000));
+    return true;
+}
+
+typedef struct control_stress {
+    pcmmix *mixer;
+    const pcmmix_sample *sample;
+    bool ok;
+} control_stress;
+
+static void *
+control_stress_main(void *argument)
+{
+    control_stress *stress = argument;
+
+    stress->ok = true;
+    for (int iteration = 0; iteration < 5000; ++iteration) {
+        const int voice = pcmmix_loop(stress->mixer, stress->sample,
+                                     0.25f, 1.0f);
+
+        if (voice <= 0 ||
+            !pcmmix_voice_set(stress->mixer, voice, 0.5f, 1.25f) ||
+            !pcmmix_voice_stop(stress->mixer, voice)) {
+            stress->ok = false;
+            break;
+        }
+    }
+    return NULL;
+}
+
+static bool
+test_concurrent_voice_control(void)
+{
+    enum { THREADS = 4 };
+    static int16_t frames[1024];
+    const pcmmix_sample sample = {frames, 1024u};
+    const char *sink_argv[] = {"/bin/cat", NULL};
+    pcmmix_options options;
+    pcmmix mixer;
+    pthread_t threads[THREADS];
+    control_stress stress[THREADS];
+
+    fill_const(frames, 1024u, 1000);
+    pcmmix_options_init(&options);
+    options.sink_argv = sink_argv;
+    options.max_voices = PCMMIX_VOICES_MAX;
+    CHECK(pcmmix_start(&mixer, &options));
+    for (size_t index = 0u; index < THREADS; ++index) {
+        stress[index] = (control_stress){&mixer, &sample, false};
+        CHECK(pthread_create(&threads[index], NULL, control_stress_main,
+                             &stress[index]) == 0);
+    }
+    for (size_t index = 0u; index < THREADS; ++index) {
+        CHECK(pthread_join(threads[index], NULL) == 0);
+        CHECK(stress[index].ok);
+    }
+    pcmmix_stop(&mixer);
+    return true;
+}
 
 static bool
 test_sink_capture(void)
@@ -614,17 +888,24 @@ test_sink_capture(void)
     FILE *fp = fopen(capture, "rb");
     CHECK(fp != NULL);
     long tone_frames = 0, zero_frames = 0;
-    int16_t chunk[8192];
+    uint8_t chunk[8192 * 2u];
+    bool aligned = true;
     size_t got;
-    while ((got = fread(chunk, sizeof chunk[0],
-                        sizeof chunk / sizeof chunk[0], fp)) > 0) {
-        for (size_t i = 0; i < got; i++) {
-            if (chunk[i] >= 11998 && chunk[i] <= 12002) tone_frames++;
-            else if (chunk[i] == 0) zero_frames++;
+    while ((got = fread(chunk, 1u, sizeof chunk, fp)) > 0u) {
+        if ((got & 1u) != 0u) aligned = false;
+        for (size_t i = 0u; i + 1u < got; i += 2u) {
+            const uint16_t raw = (uint16_t)(
+                (uint16_t)chunk[i] | ((uint16_t)chunk[i + 1u] << 8));
+            const int32_t frame = raw <= (uint16_t)INT16_MAX ?
+                                  (int32_t)raw : (int32_t)raw - 65536;
+
+            if (frame >= 11998 && frame <= 12002) tone_frames++;
+            else if (frame == 0) zero_frames++;
         }
     }
     CHECK(fclose(fp) == 0);
     CHECK(unlink(capture) == 0);
+    CHECK(aligned);
     CHECK(tone_frames >= 4000); /* nearly all 4410 tone frames captured */
     CHECK(zero_frames >= 64);   /* silence was streamed too */
     return true;
@@ -643,7 +924,8 @@ test_sink_death_degrades(void)
     pcmmix mixer;
     CHECK(pcmmix_start(&mixer, &options));
     CHECK(pcmmix_is_running(&mixer));
-    CHECK(pcmmix_backend_name(&mixer) != NULL);
+    const char *backend = pcmmix_backend_name(&mixer);
+    CHECK(backend != NULL && strcmp(backend, "sh") == 0);
 
     static int16_t tone[512];
     fill_const(tone, 512, 6000);
@@ -653,6 +935,9 @@ test_sink_death_degrades(void)
     for (int i = 0; i < 600 && pcmmix_is_running(&mixer); i++) sleep_ms(10);
     CHECK(!pcmmix_is_running(&mixer));
     CHECK(pcmmix_backend_name(&mixer) == NULL);
+    CHECK(strcmp(backend, "sh") == 0); /* immutable until stop */
+    CHECK(!pcmmix_is_enabled(&mixer));
+    pcmmix_set_enabled(&mixer, true);
     CHECK(!pcmmix_is_enabled(&mixer));
     CHECK(pcmmix_play(&mixer, &sample, 1.0f, 1.0f) == -1);
     CHECK(pcmmix_loop(&mixer, &sample, 1.0f, 1.0f) == -1);
@@ -713,6 +998,10 @@ main(void)
         {"resampler pitch and interpolation",
          test_resampler_pitch_and_interpolation},
         {"single voice reproduces sample", test_single_voice_reproduces_sample},
+        {"full scale and exact completion",
+         test_full_scale_and_exact_completion},
+        {"transport mix_block is silent",
+         test_transport_mix_block_is_silent},
         {"voice sum and clipping", test_voice_sum_and_clipping},
         {"loop wrap and live voice_set", test_loop_wrap_and_live_voice_set},
         {"handle generations and stealing",
@@ -720,6 +1009,12 @@ main(void)
         {"music crossfade", test_music_crossfade},
         {"music stop fade", test_music_stop_fade},
         {"generator mixed under voices", test_generator_mixed_under_voices},
+        {"nonfinite controls are bounded", test_nonfinite_controls_are_bounded},
+        {"SIGPIPE disposition is preserved",
+         test_sigpipe_disposition_is_preserved},
+        {"high descriptor transport", test_high_descriptor_transport},
+        {"stalled sink has bounded stop", test_stalled_sink_has_bounded_stop},
+        {"concurrent voice control", test_concurrent_voice_control},
         {"sink capture integration", test_sink_capture},
         {"sink death degrades gracefully", test_sink_death_degrades},
         {"failed start is safe", test_failed_start_is_safe}

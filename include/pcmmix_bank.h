@@ -14,8 +14,12 @@ extern "C" {
 #endif
 
 #define PCMMIX_BANK_VERSION_MAJOR 0
-#define PCMMIX_BANK_VERSION_MINOR 1
+#define PCMMIX_BANK_VERSION_MINOR 2
 #define PCMMIX_BANK_VERSION_PATCH 0
+
+#if PCMMIX_VERSION_MAJOR == 0 && PCMMIX_VERSION_MINOR < 2
+#error "pcmmix-bank 0.2 requires pcm-mixer 0.2 or newer"
+#endif
 
 #define PCMMIX_BANK_CUES_MAX 64u
 #define PCMMIX_BANK_VARIANTS_MAX 8u
@@ -53,7 +57,10 @@ bool pcmmix_bank_set_borrowed(pcmmix_bank *bank, uint32_t cue,
                               uint32_t variant, const pcmmix_sample *sample,
                               float gain, float pitch);
 
-/* Transfer a malloc-compatible frame buffer to the bank on success. */
+/* Transfer a malloc-compatible frame buffer to the bank on success. A buffer
+ * already referenced by another slot in this bank is rejected; taking or
+ * re-taking it into the same slot safely transfers ownership and updates that
+ * slot's metadata. */
 bool pcmmix_bank_take(pcmmix_bank *bank, uint32_t cue, uint32_t variant,
                       int16_t *frames, size_t frame_count, float gain,
                       float pitch);

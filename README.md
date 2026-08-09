@@ -20,6 +20,7 @@ dependencies.
 make
 make test
 make sanitize
+make benchmark
 ./build/beep
 ```
 
@@ -82,43 +83,49 @@ pcmmix_bank_clear(&bank);
 Variant loading is transactional: if any path fails, the cue's previous
 samples remain intact. `pcmmix_bank_take()` transfers a malloc-compatible
 generated buffer only on success; `pcmmix_bank_set_borrowed()` leaves
-ownership with the caller. Bank mutation and cleanup are control-thread
-operations and must not race playback or precede mixer shutdown.
+ownership with the caller. A frame pointer may be borrowed by more than one
+slot, but it may be owned by only one; attempts to create an ownership alias
+are rejected without changing the bank. Bank mutation and cleanup are
+control-thread operations and must not race playback or precede mixer
+shutdown.
 
 ## Transport
 
 The stream contract is fixed: signed 16-bit little-endian, mono, at the
 configured sample rate (default 44100 Hz). `pcmmix_start()` probes for
-sinks in this order and forks the first executable on `PATH` that survives
-an ~80 ms liveness window (a sink with no server to talk to exits
-immediately):
+sinks in this order and uses `posix_spawnp()` for the first executable on
+`PATH` that survives an ~80 ms liveness window (a sink with no server to
+talk to exits immediately):
 
 1. `pacat` (PulseAudio)
 2. `pw-play` (PipeWire)
 3. `aplay` (ALSA)
 4. `play` (sox)
 
-The sink reads PCM from a pipe dup2'd to its stdin; its stdout/stderr are
-sent to `/dev/null` so sink chatter cannot land in the host's terminal UI.
-`options.sink_argv` replaces the probe with a custom NULL-terminated argv,
-which is also how integration tests capture the stream (`sh -c 'cat >
-file'`).
+The sink reads explicitly encoded little-endian PCM from a close-on-exec
+pipe mapped to its stdin; its stdout/stderr are sent to `/dev/null` so sink
+chatter cannot land in the host's terminal UI. `options.sink_argv` replaces
+the probe with a custom NULL-terminated argv, which is also how integration
+tests capture the stream (`sh -c 'cat > file'`).
 
 The latency model: on Linux the pipe is shrunk with `F_SETPIPE_SZ` to about
 `latency_ms` worth of audio, the mixer streams continuously — silence
 included — so the pipe runs full, and the sink's blocking reads then clock
 the mixer thread at a fixed latency with no underruns. Where
 `F_SETPIPE_SZ` is unavailable the mixer falls back to sleep-based pacing,
-at the cost of a larger pipe buffer. Each blocking write is bounded by
-`select()` so shutdown never hangs on a wedged sink.
+at the cost of a larger pipe buffer. The write end remains nonblocking and
+`poll()` uses a monotonic no-progress deadline, so large descriptor numbers,
+signals, partial writes, and a wedged sink cannot make shutdown hang.
 
-`pcmmix_start()` ignores `SIGPIPE` process-wide: sink death must not kill
-the host. A sink that dies mid-run (write error, exit, or a multi-second
-stall) winds the mixer down into a silent state: `pcmmix_is_running()`
-returns false, `pcmmix_backend_name()` returns NULL, the enabled flag
-clears, and every playback call becomes a safe no-op. The game keeps
-running, just silently. `pcmmix_stop()` is still required and reaps the
-sink, escalating to SIGTERM then SIGKILL if it will not exit.
+Only the mixer thread blocks `SIGPIPE`; the host process's signal disposition
+is not changed. A sink that dies mid-run (write error, exit, or a
+multi-second stall) winds the mixer down into a silent state:
+`pcmmix_is_running()` returns false, `pcmmix_backend_name()` returns NULL,
+the enabled flag clears, and every playback call becomes a safe no-op that
+cannot revive the dead transport. A previously returned backend-name pointer
+remains valid until `pcmmix_stop()`. The game keeps running, just silently.
+`pcmmix_stop()` is still required and reaps the sink, escalating to SIGTERM
+then SIGKILL if it will not exit.
 
 ## Voices
 
@@ -133,11 +140,13 @@ a seamless loop, both with a linear gain and a resampling pitch ratio
 When every slot is busy, the most-finished one-shot is stolen; looping
 voices are never stolen. Handles are generation-checked, so a stale handle
 whose slot has been recycled is rejected instead of adjusting the wrong
-voice.
+voice. Non-finite controls are normalized before they reach the resampler,
+and a one-shot becomes inactive in the same block that consumes its final
+frame.
 
 The master bus applies `tanh` soft-clipping by default
-(`options.soft_clip = false` selects hard clipping instead, which tests use
-for sample-exact output).
+(`options.soft_clip = false` selects hard clipping over the full signed
+16-bit range, which tests use for sample-exact output).
 
 ## Music
 
@@ -172,8 +181,11 @@ only. An asset that does not match is a bug in whatever generated it, and
 silently resampling would hide that. Failures return NULL with a
 human-readable reason (`"sfx/hit.wav is 2ch/16bit/44100Hz, expected
 1ch/16bit/44100Hz"`) written into the caller's error buffer. The parser
-walks RIFF chunks with word-alignment padding and bounds checks rather than
-assuming a canonical 44-byte header, and caps files at 64 MiB.
+streams RIFF chunks within the declared RIFF boundary, validates chunk
+padding, duplicate format/data chunks, PCM byte rate and block alignment,
+and even sample-byte counts rather than assuming a canonical 44-byte
+header. Files are capped at 64 MiB, and only the decoded output buffer is
+allocated.
 
 ## Offline rendering and testing
 
@@ -182,7 +194,18 @@ caller pulls the master mix with `pcmmix_mix_block()`, which renders the
 exact fill the transport thread would stream. This is how the unit tests
 assert on mixer output without any audio hardware, and it doubles as a
 bounce-to-disk path. For transport-level tests, `options.sink_argv` can
-point at any PCM-consuming command.
+point at any PCM-consuming command. Calling `pcmmix_mix_block()` on a
+transport-backed mixer returns silence without advancing live voice, music,
+or generator state.
+
+## Performance checks
+
+`make benchmark` builds deterministic mixer and WAV-loader microbenchmarks.
+The mixer benchmark covers idle output, unity-pitch and resampled voices,
+soft and hard clipping, a saturated 16-voice mix, and bank selection. The
+WAV benchmark generates and repeatedly loads a strict fixture. Results are
+reported as nanoseconds per frame, choice, or input byte so changes can be
+compared on the same host; they are measurements, not pass/fail tests.
 
 ## Threading contract
 
@@ -191,7 +214,7 @@ point at any PCM-consuming command.
 touches the mixer object or sample memory. All other calls are
 thread-safe against the mixer thread and each other. The generator
 callback runs on the mixer thread. `pcmmix_mix_block()` is for offline
-mixers only — never call it while a transport thread is live.
+mixers; an accidental transport-mode call is safe but produces silence.
 
 ## Install
 

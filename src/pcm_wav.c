@@ -1,10 +1,9 @@
 /* Strict RIFF/WAVE loader for the mixer's fixed transport format.
  *
- * Deliberately strict: only PCM, mono, 16-bit, 44100 Hz is accepted. An
- * asset bank that does not match is a bug in whatever generated it, and
- * silently resampling or downmixing would hide that. Callers treat a NULL
- * return as "degrade to silence and report the reason", never as
- * "synthesise something instead". */
+ * Deliberately strict: only internally consistent PCM, mono, 16-bit,
+ * 44100 Hz assets are accepted. Chunks are parsed as a bounded stream so a
+ * maximum-size file does not need a second whole-file allocation beside the
+ * decoded sample buffer. */
 #include "pcm_mixer.h"
 
 #include <stdio.h>
@@ -15,108 +14,177 @@
 #define WAV_CHANNELS 1u
 #define WAV_BITS 16u
 
-/* Guards a corrupt or hostile header from asking for a huge allocation:
- * 64 MiB is over 12 minutes of mono 44.1 kHz audio. */
+/* 64 MiB is over 12 minutes of mono 44.1 kHz audio. */
 #define WAV_MAX_BYTES ((long)1 << 26)
+#define WAV_READ_FRAMES 4096u
 
-static uint16_t wav_u16(const uint8_t *p)
+static uint16_t wav_u16(const uint8_t *bytes)
 {
-    return (uint16_t)(p[0] | (p[1] << 8));
+    return (uint16_t)(bytes[0] | (bytes[1] << 8));
 }
 
-static uint32_t wav_u32(const uint8_t *p)
+static uint32_t wav_u32(const uint8_t *bytes)
 {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
+    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+           ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+}
+
+static bool skip_bytes(FILE *file, size_t count)
+{
+    return fseek(file, (long)count, SEEK_CUR) == 0;
 }
 
 int16_t *pcmmix_wav_load(const char *path, size_t *out_frames, char *err,
                          size_t err_len)
 {
-    if (out_frames) *out_frames = 0;
-    if (err && err_len) err[0] = '\0';
+    uint8_t riff_header[12];
+    uint8_t chunk_header[8];
+    int16_t *samples = NULL;
+    FILE *file = NULL;
+    long file_size;
+    size_t bounded_size;
+    size_t position;
+    long data_offset = -1;
+    uint32_t data_length = 0u;
+    bool have_format = false;
+    bool have_data = false;
 
-#define WAV_FAIL(...)                                                        \
-    do {                                                                     \
-        if (err && err_len) snprintf(err, err_len, __VA_ARGS__);             \
-        free(bytes);                                                         \
-        if (fp) fclose(fp);                                                  \
-        return NULL;                                                         \
+    if (out_frames != NULL) *out_frames = 0u;
+    if (err != NULL && err_len != 0u) err[0] = '\0';
+
+#define WAV_FAIL(...)                                                         \
+    do {                                                                      \
+        if (err != NULL && err_len != 0u)                                     \
+            (void)snprintf(err, err_len, __VA_ARGS__);                        \
+        free(samples);                                                        \
+        if (file != NULL) (void)fclose(file);                                 \
+        return NULL;                                                          \
     } while (0)
 
-    uint8_t *bytes = NULL;
-    FILE *fp = NULL;
-    if (!path || !out_frames) WAV_FAIL("invalid arguments");
-
-    fp = fopen(path, "rb");
-    if (!fp) WAV_FAIL("cannot open %s", path);
-
-    if (fseek(fp, 0, SEEK_END) != 0) WAV_FAIL("cannot seek %s", path);
-    long size = ftell(fp);
-    if (size < 44 || size > WAV_MAX_BYTES)
+    if (path == NULL || out_frames == NULL) WAV_FAIL("invalid arguments");
+    file = fopen(path, "rb");
+    if (file == NULL) WAV_FAIL("cannot open %s", path);
+    if (fseek(file, 0, SEEK_END) != 0) WAV_FAIL("cannot seek %s", path);
+    file_size = ftell(file);
+    if (file_size < 44 || file_size > WAV_MAX_BYTES)
         WAV_FAIL("implausible size for %s", path);
-    rewind(fp);
-
-    bytes = malloc((size_t)size);
-    if (!bytes) WAV_FAIL("out of memory reading %s", path);
-    if (fread(bytes, 1, (size_t)size, fp) != (size_t)size)
-        WAV_FAIL("short read on %s", path);
-    fclose(fp);
-    fp = NULL;
-
-    if (memcmp(bytes, "RIFF", 4) != 0 || memcmp(bytes + 8, "WAVE", 4) != 0)
+    bounded_size = (size_t)file_size;
+    if (fseek(file, 0, SEEK_SET) != 0 ||
+        fread(riff_header, 1u, sizeof riff_header, file) !=
+            sizeof riff_header)
+        WAV_FAIL("short RIFF header: %s", path);
+    if (memcmp(riff_header, "RIFF", 4u) != 0 ||
+        memcmp(riff_header + 8u, "WAVE", 4u) != 0)
         WAV_FAIL("not a RIFF/WAVE file: %s", path);
+    if ((uint64_t)wav_u32(riff_header + 4u) + UINT64_C(8) !=
+        (uint64_t)bounded_size)
+        WAV_FAIL("RIFF size does not match file: %s", path);
 
-    /* Walk chunks rather than assuming a canonical 44-byte header: writers
-     * are free to emit LIST/fact chunks before data. */
-    bool have_fmt = false;
-    const uint8_t *data = NULL;
-    uint32_t data_len = 0;
-    size_t file_size = (size_t)size;
-    size_t pos = 12;
+    position = sizeof riff_header;
+    while (position < bounded_size) {
+        uint32_t length;
+        size_t padded;
+        size_t remaining;
 
-    while (pos + 8 <= file_size) {
-        const uint8_t *id = bytes + pos;
-        uint32_t len = wav_u32(bytes + pos + 4);
-        size_t body = pos + 8;
-        if (len > file_size - body) /* overflow-safe bound */
+        if (bounded_size - position < sizeof chunk_header)
+            WAV_FAIL("trailing partial chunk header: %s", path);
+        if (fread(chunk_header, 1u, sizeof chunk_header, file) !=
+            sizeof chunk_header)
+            WAV_FAIL("short chunk header: %s", path);
+        position += sizeof chunk_header;
+        length = wav_u32(chunk_header + 4u);
+        remaining = bounded_size - position;
+        if ((size_t)length > remaining)
             WAV_FAIL("chunk overruns file: %s", path);
+        padded = (size_t)length;
+        if ((length & 1u) != 0u) ++padded;
+        if (padded > remaining)
+            WAV_FAIL("chunk padding overruns file: %s", path);
 
-        if (memcmp(id, "fmt ", 4) == 0) {
-            if (len < 16) WAV_FAIL("short fmt chunk: %s", path);
-            uint16_t format = wav_u16(bytes + body);
-            uint16_t channels = wav_u16(bytes + body + 2);
-            uint32_t rate = wav_u32(bytes + body + 4);
-            uint16_t bits = wav_u16(bytes + body + 14);
-            if (format != 1)
+        if (memcmp(chunk_header, "fmt ", 4u) == 0) {
+            uint8_t format_bytes[16];
+            uint16_t format;
+            uint16_t channels;
+            uint32_t rate;
+            uint32_t byte_rate;
+            uint16_t block_align;
+            uint16_t bits;
+            uint64_t expected_byte_rate;
+            uint32_t expected_align;
+
+            if (have_format) WAV_FAIL("duplicate fmt chunk: %s", path);
+            if (length < sizeof format_bytes)
+                WAV_FAIL("short fmt chunk: %s", path);
+            if (fread(format_bytes, 1u, sizeof format_bytes, file) !=
+                sizeof format_bytes)
+                WAV_FAIL("short fmt body: %s", path);
+            format = wav_u16(format_bytes);
+            channels = wav_u16(format_bytes + 2u);
+            rate = wav_u32(format_bytes + 4u);
+            byte_rate = wav_u32(format_bytes + 8u);
+            block_align = wav_u16(format_bytes + 12u);
+            bits = wav_u16(format_bytes + 14u);
+            if (format != 1u)
                 WAV_FAIL("%s is not PCM (format %u)", path,
-                         (unsigned)format);
+                         (unsigned int)format);
             if (channels != WAV_CHANNELS || rate != WAV_RATE ||
                 bits != WAV_BITS)
                 WAV_FAIL("%s is %uch/%ubit/%uHz, expected %uch/%ubit/%uHz",
-                         path, (unsigned)channels, (unsigned)bits,
-                         (unsigned)rate, WAV_CHANNELS, WAV_BITS, WAV_RATE);
-            have_fmt = true;
-        } else if (memcmp(id, "data", 4) == 0) {
-            data = bytes + body;
-            data_len = len;
+                         path, (unsigned int)channels, (unsigned int)bits,
+                         (unsigned int)rate, WAV_CHANNELS, WAV_BITS, WAV_RATE);
+            expected_align = (uint32_t)channels * (uint32_t)bits / 8u;
+            expected_byte_rate = (uint64_t)rate * expected_align;
+            if (block_align != expected_align ||
+                byte_rate != expected_byte_rate)
+                WAV_FAIL("inconsistent PCM rate/alignment in %s", path);
+            have_format = true;
+            if (!skip_bytes(file, padded - sizeof format_bytes))
+                WAV_FAIL("cannot seek fmt chunk: %s", path);
+        } else {
+            if (memcmp(chunk_header, "data", 4u) == 0) {
+                if (have_data) WAV_FAIL("duplicate data chunk: %s", path);
+                if ((length & 1u) != 0u)
+                    WAV_FAIL("odd PCM data length: %s", path);
+                data_offset = (long)position;
+                data_length = length;
+                have_data = true;
+            }
+            if (!skip_bytes(file, padded))
+                WAV_FAIL("cannot seek chunk body: %s", path);
         }
-
-        pos = body + len + (len & 1u); /* chunks are word-aligned */
+        position += padded;
     }
 
-    if (!have_fmt) WAV_FAIL("no fmt chunk: %s", path);
-    if (!data) WAV_FAIL("no data chunk: %s", path);
-    if (data_len < 2) WAV_FAIL("empty data chunk: %s", path);
+    if (!have_format) WAV_FAIL("no fmt chunk: %s", path);
+    if (!have_data) WAV_FAIL("no data chunk: %s", path);
+    if (data_length < 2u) WAV_FAIL("empty data chunk: %s", path);
 
-    size_t frames = data_len / 2u; /* a trailing odd byte is ignored */
-    int16_t *samples = malloc(frames * sizeof *samples);
-    if (!samples) WAV_FAIL("out of memory decoding %s", path);
-    for (size_t i = 0; i < frames; i++)
-        samples[i] = (int16_t)wav_u16(data + i * 2u);
+    const size_t frame_count = (size_t)data_length / 2u;
+    samples = malloc(frame_count * sizeof samples[0]);
+    if (samples == NULL) WAV_FAIL("out of memory decoding %s", path);
+    if (fseek(file, data_offset, SEEK_SET) != 0)
+        WAV_FAIL("cannot seek PCM data: %s", path);
+    for (size_t decoded = 0u; decoded < frame_count;) {
+        uint8_t bytes[WAV_READ_FRAMES * 2u];
+        size_t take = frame_count - decoded;
 
-    free(bytes);
-    *out_frames = frames;
+        if (take > WAV_READ_FRAMES) take = WAV_READ_FRAMES;
+        if (fread(bytes, 2u, take, file) != take)
+            WAV_FAIL("short PCM data: %s", path);
+        for (size_t index = 0u; index < take; ++index) {
+            const uint16_t raw = wav_u16(bytes + index * 2u);
+
+            samples[decoded + index] = raw <= (uint16_t)INT16_MAX ?
+                (int16_t)raw : (int16_t)((int32_t)raw - 65536);
+        }
+        decoded += take;
+    }
+    if (fclose(file) != 0) {
+        file = NULL;
+        WAV_FAIL("cannot close %s", path);
+    }
+    file = NULL;
+    *out_frames = frame_count;
     return samples;
 
 #undef WAV_FAIL

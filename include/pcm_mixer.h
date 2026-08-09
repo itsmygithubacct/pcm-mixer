@@ -2,7 +2,7 @@
  *
  * Mixes 16-bit signed mono PCM voices (with linear-interpolation
  * resampling), a two-slot crossfading music layer, and an optional live
- * generator callback, then streams raw s16le down a pipe to a forked
+ * generator callback, then streams raw s16le down a pipe to a spawned
  * command-line audio sink (pacat, pw-play, aplay, or sox play). The pipe is
  * shrunk so its capacity is the audio latency and the sink's blocking reads
  * clock the mixer thread. No sink, or the sink dying mid-run, degrades to a
@@ -22,6 +22,10 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define PCMMIX_VERSION_MAJOR 0
+#define PCMMIX_VERSION_MINOR 2
+#define PCMMIX_VERSION_PATCH 0
 
 /* Hard capacity limits baked into the mixer object. */
 #define PCMMIX_VOICES_MAX 32u
@@ -106,11 +110,11 @@ void pcmmix_options_init(pcmmix_options *options);
 
 /* Start the mixer. The mixer object may hold any prior contents; it is
  * fully (re)initialized. Pass NULL options for defaults. In transport mode
- * this ignores SIGPIPE process-wide, spawns the sink (each candidate gets
- * an ~80 ms liveness probe), and launches the mixer thread. Returns false
- * -- with the object left in a safe, stopped state -- when no sink
- * survives the probe, an option is out of range, or a resource limit is
- * hit. Must not be called on a mixer that is already started. */
+ * this spawns the sink (each candidate gets an ~80 ms liveness probe),
+ * blocks SIGPIPE only in the transport thread, and launches the mixer
+ * thread. Returns false -- with the object left in a safe, stopped state --
+ * when no sink survives the probe, an option is out of range, or a resource
+ * limit is hit. Must not be called on a mixer that is already started. */
 bool pcmmix_start(pcmmix *mixer, const pcmmix_options *options);
 
 /* Stop the mixer: joins the mixer thread, closes the pipe, and reaps the
@@ -125,7 +129,8 @@ void pcmmix_stop(pcmmix *mixer);
 bool pcmmix_is_running(pcmmix *mixer);
 
 /* Executable name of the live sink ("pacat", "aplay", ...), or NULL when
- * the mixer is offline, stopped, never started, or the sink has died. */
+ * the mixer is offline, stopped, never started, or the sink has died. A
+ * non-NULL pointer and its immutable text remain valid until pcmmix_stop(). */
 const char *pcmmix_backend_name(pcmmix *mixer);
 
 /* Master mute. Disabling silences and clears all voices and music
@@ -136,8 +141,9 @@ bool pcmmix_is_enabled(pcmmix *mixer);
 
 /* --- one-shots and held loops --------------------------------------- */
 
-/* Play a one-shot. vol is a linear gain, clamped to 0..2; pitch is the
- * resampling ratio, clamped to 1/32..32 (values <= 0 mean 1.0). Returns a
+/* Play a one-shot. vol is a linear gain, clamped to 0..2 (NaN becomes zero);
+ * pitch is the resampling ratio, clamped to 1/32..32 (non-positive or
+ * non-finite values mean 1.0). Returns a
  * voice handle (> 0) or -1 when the mixer is not running, is disabled, the
  * sample is invalid, or no slot could be claimed. When every slot is busy
  * the most-finished non-looping voice is stolen; looping voices are never
@@ -172,7 +178,8 @@ bool pcmmix_voice_active(pcmmix *mixer, int voice);
 void pcmmix_music_play(pcmmix *mixer, const pcmmix_sample *sample, float vol,
                        bool loop);
 
-/* Fade all music to silence over fade_seconds (<= 0 stops immediately). */
+/* Fade all music to silence over fade_seconds (<= 0 or non-finite stops
+ * immediately). */
 void pcmmix_music_stop(pcmmix *mixer, float fade_seconds);
 
 /* Frames pointer of the track currently playing or fading in, or NULL. */
@@ -189,16 +196,18 @@ void pcmmix_set_generator(pcmmix *mixer, pcmmix_generator_fn fn, void *user);
 /* Render `frames` frames of the master mix into dst, advancing all voice,
  * music, and generator state. This is the exact fill the transport thread
  * streams to the sink; call it yourself only on an offline mixer (unit
- * tests, bounce-to-disk), never while a mixer thread is live. */
+ * tests, bounce-to-disk). A transport-backed mixer returns silence here
+ * instead of advancing live voice state from the wrong thread. */
 void pcmmix_mix_block(pcmmix *mixer, int16_t *dst, size_t frames);
 
 /* --- WAV loading ------------------------------------------------------ */
 
 /* Strict WAV loader: PCM, mono, 16-bit, 44100 Hz only. Anything else fails
- * with a human-readable reason written to err (when err_len > 0). Walks
- * RIFF chunks (word-aligned, bounds-checked, 64 MiB file cap) rather than
- * assuming a canonical 44-byte header. Returns a malloc'd frame buffer to
- * release with pcmmix_wav_free(); *out_frames receives the frame count. */
+ * with a human-readable reason written to err (when err_len > 0). Streams
+ * RIFF chunks within the declared RIFF boundary, validating padding and
+ * format byte counts under a 64 MiB file cap instead of assuming a
+ * canonical 44-byte header. Returns a malloc'd frame buffer to release with
+ * pcmmix_wav_free(); *out_frames receives the frame count. */
 int16_t *pcmmix_wav_load(const char *path, size_t *out_frames, char *err,
                          size_t err_len);
 

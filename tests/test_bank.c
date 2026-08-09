@@ -1,5 +1,6 @@
 #include "pcmmix_bank.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,26 +155,100 @@ static bool test_invalid_inputs(void)
 {
     pcmmix_bank bank;
     pcmmix_sample empty = {0};
-    int16_t *frames = malloc(sizeof *frames);
+    int16_t frame = 0;
 
-    CHECK(frames != NULL);
     CHECK(!pcmmix_bank_init(NULL, 1u, 0u));
     CHECK(!pcmmix_bank_init(&bank, PCMMIX_BANK_CUES_MAX + 1u, 0u));
     CHECK(pcmmix_bank_init(&bank, 1u, 0u));
     CHECK(!pcmmix_bank_set_borrowed(&bank, 1u, 0u, &empty, 1.0f, 1.0f));
-    CHECK(!pcmmix_bank_take(&bank, 0u, PCMMIX_BANK_VARIANTS_MAX, frames, 1u,
+    CHECK(!pcmmix_bank_take(&bank, 0u, PCMMIX_BANK_VARIANTS_MAX, &frame, 1u,
                             1.0f, 1.0f));
-    free(frames); /* ownership transfers only on success */
     CHECK(pcmmix_bank_choose(&bank, 0u) == -1);
     pcmmix_bank_clear(&bank);
     return true;
 }
 
+static bool test_alias_ownership_and_nonfinite_metadata(void)
+{
+    pcmmix_bank bank;
+    int16_t *owned = malloc(8u * sizeof owned[0]);
+    int16_t *borrowed_then_owned = malloc(4u * sizeof owned[0]);
+    int16_t borrowed_frames[4] = {1000, 1000, 1000, 1000};
+    const pcmmix_sample borrowed = {borrowed_frames, 4u};
+    pcmmix_sample borrowed_alias;
+    bool bank_initialized = false;
+    bool owned_transferred = false;
+    bool alias_transferred = false;
+    bool ok = false;
+
+#define BANK_CHECK(condition)                                                 \
+    do {                                                                      \
+        if (!(condition)) {                                                   \
+            (void)fprintf(stderr, "%s:%d: check failed: %s\n",             \
+                          __FILE__, __LINE__, #condition);                     \
+            goto cleanup;                                                     \
+        }                                                                     \
+    } while (false)
+
+    BANK_CHECK(owned != NULL && borrowed_then_owned != NULL);
+    borrowed_alias = (pcmmix_sample){borrowed_then_owned, 4u};
+    BANK_CHECK(pcmmix_bank_init(&bank, 2u, 1u));
+    bank_initialized = true;
+    BANK_CHECK(pcmmix_bank_take(&bank, 0u, 0u, owned, 8u, 1.0f, 1.0f));
+    owned_transferred = true;
+    /* Re-taking the same owned pointer in its existing slot is a metadata
+     * update, not a free followed by a dangling re-installation. */
+    BANK_CHECK(pcmmix_bank_take(&bank, 0u, 0u, owned, 7u, 0.5f, 2.0f));
+    BANK_CHECK(pcmmix_bank_sample_at(&bank, 0u, 0u)->frame_count == 7u);
+    /* No second slot may claim ownership or borrow memory owned by this bank. */
+    BANK_CHECK(!pcmmix_bank_take(&bank, 1u, 0u, owned, 7u, 1.0f, 1.0f));
+    const pcmmix_sample alias = {owned, 7u};
+    BANK_CHECK(!pcmmix_bank_set_borrowed(&bank, 1u, 0u, &alias,
+                                         1.0f, 1.0f));
+
+    BANK_CHECK(pcmmix_bank_set_borrowed(&bank, 1u, 0u, &borrowed,
+                                        NAN, NAN));
+    BANK_CHECK(bank.cues[1].variants[0].gain == 0.0f);
+    BANK_CHECK(bank.cues[1].variants[0].pitch == 1.0f);
+    BANK_CHECK(pcmmix_bank_set_borrowed(&bank, 1u, 1u, &borrowed_alias,
+                                        1.0f, 1.0f));
+    alias_transferred = pcmmix_bank_take(&bank, 0u, 1u,
+                                         borrowed_then_owned, 4u,
+                                         1.0f, 1.0f);
+    BANK_CHECK(!alias_transferred);
+    alias_transferred = pcmmix_bank_take(&bank, 1u, 1u,
+                                         borrowed_then_owned, 4u,
+                                         1.0f, 1.0f);
+    BANK_CHECK(alias_transferred);
+    ok = true;
+
+cleanup:
+    if (bank_initialized) pcmmix_bank_clear(&bank);
+    if (!owned_transferred) free(owned);
+    if (!alias_transferred) free(borrowed_then_owned);
+#undef BANK_CHECK
+    return ok;
+}
+
 int main(void)
 {
-    CHECK(test_registration_selection_and_playback());
-    CHECK(test_owned_and_transactional_loading());
-    CHECK(test_invalid_inputs());
-    (void)puts("ok: pcmmix-bank");
+    static const struct bank_test {
+        const char *name;
+        bool (*run)(void);
+    } tests[] = {
+        {"registration, selection, and playback",
+         test_registration_selection_and_playback},
+        {"owned and transactional loading",
+         test_owned_and_transactional_loading},
+        {"invalid inputs", test_invalid_inputs},
+        {"alias ownership and nonfinite metadata",
+         test_alias_ownership_and_nonfinite_metadata}
+    };
+
+    for (size_t index = 0u; index < sizeof tests / sizeof tests[0]; ++index) {
+        CHECK(tests[index].run());
+        (void)printf("ok - %s\n", tests[index].name);
+    }
+    (void)printf("%zu tests passed\n", sizeof tests / sizeof tests[0]);
     return 0;
 }
