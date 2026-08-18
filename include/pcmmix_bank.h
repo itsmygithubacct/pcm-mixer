@@ -86,8 +86,12 @@ int pcmmix_bank_choose(pcmmix_bank *bank, uint32_t cue);
 /* Apply per-variant gain/pitch and return a normal pcm-mixer voice handle. */
 int pcmmix_bank_play(pcmmix *mixer, pcmmix_bank *bank, uint32_t cue,
                      float gain, float pitch);
+int pcmmix_bank_play_pan(pcmmix *mixer, pcmmix_bank *bank, uint32_t cue,
+                         float gain, float pitch, float pan);
 int pcmmix_bank_loop(pcmmix *mixer, pcmmix_bank *bank, uint32_t cue,
                      float gain, float pitch);
+int pcmmix_bank_loop_pan(pcmmix *mixer, pcmmix_bank *bank, uint32_t cue,
+                         float gain, float pitch, float pan);
 
 #ifdef __cplusplus
 }

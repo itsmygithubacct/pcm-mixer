@@ -980,6 +980,53 @@ test_failed_start_is_safe(void)
     return true;
 }
 
+static long channel_energy(const int16_t *samples, size_t frames,
+                           size_t channel)
+{
+    long energy = 0;
+    for (size_t i = 0u; i < frames; ++i) {
+        long value = samples[i * 2u + channel];
+        energy += value < 0 ? -value : value;
+    }
+    return energy;
+}
+
+static bool test_stereo_pan_energy(void)
+{
+    static const int16_t tone[8] = { 8000, 8000, 8000, 8000,
+                                     8000, 8000, 8000, 8000 };
+    const pcmmix_sample sample = { tone, 8u };
+    const float pans[3] = { -1.0f, 0.0f, 1.0f };
+    long left[3], right[3];
+
+    for (size_t p = 0u; p < 3u; ++p) {
+        pcmmix mixer;
+        pcmmix_options options;
+        int16_t output[16] = {0};
+        pcmmix_options_init(&options);
+        options.offline = true;
+        options.soft_clip = false;
+        options.output_channels = 2u;
+        CHECK(pcmmix_start(&mixer, &options));
+        CHECK(pcmmix_play_pan(&mixer, &sample, 1.0f, 1.0f, pans[p]) > 0);
+        pcmmix_mix_block(&mixer, output, 8u);
+        left[p] = channel_energy(output, 8u, 0u);
+        right[p] = channel_energy(output, 8u, 1u);
+        pcmmix_stop(&mixer);
+    }
+    CHECK(left[0] > 0 && right[0] == 0);
+    CHECK(left[1] == right[1] && left[1] == left[0]);
+    CHECK(left[2] == 0 && right[2] == right[1]);
+
+    pcmmix mixer;
+    pcmmix_options bad;
+    pcmmix_options_init(&bad);
+    bad.offline = true;
+    bad.output_channels = 3u;
+    CHECK(!pcmmix_start(&mixer, &bad));
+    return true;
+}
+
 /* --- harness ------------------------------------------------------------ */
 
 typedef bool (*test_function)(void);
@@ -1017,7 +1064,8 @@ main(void)
         {"concurrent voice control", test_concurrent_voice_control},
         {"sink capture integration", test_sink_capture},
         {"sink death degrades gracefully", test_sink_death_degrades},
-        {"failed start is safe", test_failed_start_is_safe}
+        {"failed start is safe", test_failed_start_is_safe},
+        {"stereo pan channel energy", test_stereo_pan_energy}
     };
     size_t passed = 0u;
     size_t index;

@@ -60,6 +60,13 @@ pcmmix_stop(&mixer);
 pcmmix_wav_free(pcm);   /* samples are caller-owned; free after stop */
 ```
 
+Output remains mono by default for source and custom-sink compatibility. Set
+`options.output_channels = 2` to request interleaved stereo, then use
+`pcmmix_play_pan()` or `pcmmix_loop_pan()`. Pan is clamped to `[-1, 1]` and
+uses a deterministic linear law: center feeds both channels at full gain;
+hard left/right silences the opposite channel. Mono output intentionally
+ignores pan. Existing play, loop, and voice-set calls remain centered.
+
 ## Cue and variant bank
 
 `pcmmix_bank` replaces the sample arrays, WAV ownership loops, and random

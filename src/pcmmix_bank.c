@@ -324,7 +324,7 @@ int pcmmix_bank_choose(pcmmix_bank *bank, uint32_t cue)
 }
 
 static int play_selected(pcmmix *mixer, pcmmix_bank *bank, uint32_t cue,
-                         float gain, float pitch, bool looping)
+                         float gain, float pitch, float pan, bool looping)
 {
     const pcmmix_bank_variant *selected;
     int variant = pcmmix_bank_choose(bank, cue);
@@ -333,18 +333,30 @@ static int play_selected(pcmmix *mixer, pcmmix_bank *bank, uint32_t cue,
     selected = &bank->cues[cue].variants[(uint32_t)variant];
     gain = normalized_gain(gain) * selected->gain;
     pitch = normalized_pitch(pitch) * selected->pitch;
-    return looping ? pcmmix_loop(mixer, &selected->sample, gain, pitch) :
-                     pcmmix_play(mixer, &selected->sample, gain, pitch);
+    return looping ? pcmmix_loop_pan(mixer, &selected->sample, gain, pitch, pan) :
+                     pcmmix_play_pan(mixer, &selected->sample, gain, pitch, pan);
 }
 
 int pcmmix_bank_play(pcmmix *mixer, pcmmix_bank *bank, uint32_t cue,
                      float gain, float pitch)
 {
-    return play_selected(mixer, bank, cue, gain, pitch, false);
+    return play_selected(mixer, bank, cue, gain, pitch, 0.0f, false);
+}
+
+int pcmmix_bank_play_pan(pcmmix *mixer, pcmmix_bank *bank, uint32_t cue,
+                         float gain, float pitch, float pan)
+{
+    return play_selected(mixer, bank, cue, gain, pitch, pan, false);
 }
 
 int pcmmix_bank_loop(pcmmix *mixer, pcmmix_bank *bank, uint32_t cue,
                      float gain, float pitch)
 {
-    return play_selected(mixer, bank, cue, gain, pitch, true);
+    return play_selected(mixer, bank, cue, gain, pitch, 0.0f, true);
+}
+
+int pcmmix_bank_loop_pan(pcmmix *mixer, pcmmix_bank *bank, uint32_t cue,
+                         float gain, float pitch, float pan)
+{
+    return play_selected(mixer, bank, cue, gain, pitch, pan, true);
 }
