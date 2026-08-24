@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0 - 2026-08-24
+
+- Add optional two-channel interleaved transport and a channel-aware generator
+  while preserving one-channel defaults and the legacy callback.
+- Pass the configured channel count to every built-in sink and include it in
+  pipe-latency sizing and little-endian transport output.
+- Add coherent rendered-frame, write, timeout and sink-failure statistics.
+- Cover stereo generation, centered legacy sources, offline output, invalid
+  channel counts and statistics in the silent test suite, with a new
+  ThreadSanitizer target.
+
 ## 0.2.0 - Unreleased
 
 - Preserve the public symbol set and structure layout while documenting the

@@ -30,7 +30,7 @@ MIXER_BENCHMARK_BIN := $(BUILD_DIR)/benchmark-mixer
 WAV_BENCHMARK_BIN := $(BUILD_DIR)/benchmark-wav
 SANITIZE_BUILD_DIR ?= $(BUILD_DIR)/sanitize
 
-.PHONY: all benchmark clean install sanitize test
+.PHONY: all benchmark clean install sanitize test tsanitize
 
 all: $(STATIC_LIB) $(SHARED_LIB) $(EXAMPLE_BIN)
 
@@ -80,6 +80,11 @@ sanitize:
 	$(MAKE) BUILD_DIR=$(SANITIZE_BUILD_DIR) \
 		CFLAGS='-O1 -g3 -fsanitize=address,undefined \
 		-fno-sanitize-recover=undefined -fno-omit-frame-pointer' test
+
+tsanitize:
+	$(MAKE) BUILD_DIR=$(BUILD_DIR)/tsanitize \
+		CFLAGS='-O1 -g3 -fsanitize=thread -fno-omit-frame-pointer' \
+		LDFLAGS='-fsanitize=thread' test
 
 install: all
 	$(INSTALL) -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib

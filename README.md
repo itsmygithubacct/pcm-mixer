@@ -1,9 +1,10 @@
 # pcm-mixer
 
-`pcm-mixer` is a small C11 library that gives terminal games sound without
-an audio dependency. It software-mixes 16-bit mono PCM voices on a
-background thread and streams raw s16le down a pipe to the first available
-command-line sink (`pacat`, `pw-play`, `aplay`, or sox `play`). It
+`pcm-mixer` is a small C11 library that gives terminal games and applications
+sound without an audio dependency. It software-mixes 16-bit mono PCM voices on
+a background thread and streams mono or stereo interleaved s16le down a pipe
+to the first available command-line sink (`pacat`, `pw-play`, `aplay`, or sox
+`play`). It
 consolidates the audio layer shared by the terminal-lander / chess-bash
 family of terminal games.
 
@@ -20,6 +21,7 @@ dependencies.
 make
 make test
 make sanitize
+make tsanitize
 make benchmark
 ./build/beep
 ```
@@ -27,6 +29,7 @@ make benchmark
 The final command plays an audible test tone through the default sink
 probe. The test suite is silent: it renders offline and captures transport
 output through `cat`, and never spawns a real audio player.
+The sanitizer targets repeat it under ASan/UBSan and ThreadSanitizer.
 
 ## Quick start
 
@@ -91,8 +94,9 @@ shutdown.
 
 ## Transport
 
-The stream contract is fixed: signed 16-bit little-endian, mono, at the
-configured sample rate (default 44100 Hz). `pcmmix_start()` probes for
+The stream contract is signed 16-bit little-endian at the configured sample
+rate (default 44100 Hz) and channel count (one by default, optionally two).
+`pcmmix_start()` probes for
 sinks in this order and uses `posix_spawnp()` for the first executable on
 `PATH` that survives an ~80 ms liveness window (a sink with no server to
 talk to exits immediately):
@@ -160,7 +164,7 @@ frames pointer of the track currently playing or fading in.
 
 ## Generator hook
 
-`pcmmix_set_generator()` installs a block callback for live synthesis —
+`pcmmix_set_generator()` installs a mono block callback for live synthesis —
 engine drones tied to game state, procedural music — that would be awkward
 to express as baked samples:
 
@@ -173,6 +177,14 @@ The callback receives a zero-filled float buffer, writes samples in
 [-1, 1], and the result is added to the mix. It runs on the mixer thread
 with the mixer lock held: it must be fast and lock-free, must not block,
 and must not call back into the pcmmix API.
+
+For a stereo source, set `options.channels = 2` and install
+`pcmmix_set_generator_interleaved()`. Its zero-filled buffer contains
+`frames * channels` samples in frame-major order. Existing mono clips, music,
+and legacy generators are centered into both output channels. The selected
+channel count is passed to every built-in sink and is included in pipe-latency
+accounting. `pcmmix_get_stats()` reports coherent rendered-frame, write,
+timeout, and sink-failure counters.
 
 ## WAV loader
 
@@ -226,7 +238,9 @@ The build produces static and shared libraries. Applications may instead
 compile `src/pcm_mixer.c`, `src/pcm_wav.c`, and `src/pcmmix_bank.c` directly.
 The library has no dependencies beyond the C and POSIX system libraries.
 
-The API is pre-1.0 and may change between minor releases.
+The API is pre-1.0 and may change between minor releases. Version 0.3.0 adds
+optional stereo transport, interleaved generation, and transport statistics
+without changing mono defaults.
 
 ## License
 

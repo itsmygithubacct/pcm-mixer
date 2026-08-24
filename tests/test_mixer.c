@@ -83,6 +83,21 @@ start_offline(pcmmix *mixer, uint32_t sample_rate, uint32_t max_voices,
     return pcmmix_start(mixer, &options);
 }
 
+static bool
+start_offline_channels(pcmmix *mixer, uint32_t sample_rate,
+                       uint32_t max_voices, uint32_t channels,
+                       bool soft_clip)
+{
+    pcmmix_options options;
+    pcmmix_options_init(&options);
+    options.offline = true;
+    options.sample_rate = sample_rate;
+    options.channels = channels;
+    options.max_voices = max_voices;
+    options.soft_clip = soft_clip;
+    return pcmmix_start(mixer, &options);
+}
+
 /* --- WAV fixture helpers ---------------------------------------------- */
 
 static void
@@ -656,6 +671,73 @@ test_generator_mixed_under_voices(void)
 }
 
 static void
+stereo_generator(float *dst, size_t frames, uint32_t channels, void *user)
+{
+    uint32_t *calls = user;
+    (*calls)++;
+    for (size_t frame = 0u; frame < frames; ++frame) {
+        dst[frame * channels] = 0.25f;
+        if (channels == 2u) dst[frame * channels + 1u] = -0.25f;
+    }
+}
+
+static bool
+test_stereo_generator_and_stats(void)
+{
+    pcmmix mixer;
+    CHECK(start_offline_channels(&mixer, 8000u, 4u, 2u, false));
+    CHECK(pcmmix_channels(&mixer) == 2u);
+
+    uint32_t calls = 0u;
+    pcmmix_set_generator_interleaved(&mixer, stereo_generator, &calls);
+    int16_t output[24];
+    pcmmix_mix_block(&mixer, output, 12u);
+    CHECK(calls == 1u);
+    for (size_t frame = 0u; frame < 12u; ++frame) {
+        CHECK_NEAR(output[frame * 2u], 8192, 1);
+        CHECK_NEAR(output[frame * 2u + 1u], -8192, 1);
+    }
+
+    pcmmix_stats stats;
+    pcmmix_get_stats(&mixer, &stats);
+    CHECK(stats.rendered_frames == 12u);
+    CHECK(stats.bytes_written == 0u);
+    CHECK(stats.sink_failures == 0u);
+
+    /* Legacy mono sources and sample voices are centered into both channels. */
+    int legacy_calls = 0;
+    pcmmix_set_generator(&mixer, quarter_scale_generator, &legacy_calls);
+    pcmmix_mix_block(&mixer, output, 4u);
+    CHECK(legacy_calls == 1);
+    for (size_t frame = 0u; frame < 4u; ++frame)
+        CHECK(output[frame * 2u] == output[frame * 2u + 1u]);
+
+    pcmmix_set_generator_interleaved(&mixer, NULL, NULL);
+    const int16_t tone[] = {12000, 10000, 8000, 6000};
+    const pcmmix_sample sample = {tone, 4u};
+    CHECK(pcmmix_play(&mixer, &sample, 1.0f, 1.0f) > 0);
+    pcmmix_mix_block(&mixer, output, 4u);
+    for (size_t frame = 0u; frame < 4u; ++frame) {
+        CHECK(output[frame * 2u] == tone[frame]);
+        CHECK(output[frame * 2u + 1u] == tone[frame]);
+    }
+
+    pcmmix_get_stats(&mixer, &stats);
+    CHECK(stats.rendered_frames == 20u);
+    pcmmix_stop(&mixer);
+    CHECK(pcmmix_channels(&mixer) == 0u);
+    pcmmix_get_stats(&mixer, &stats);
+    CHECK(stats.rendered_frames == 0u);
+
+    pcmmix_options invalid;
+    pcmmix_options_init(&invalid);
+    invalid.offline = true;
+    invalid.channels = 3u;
+    CHECK(!pcmmix_start(&mixer, &invalid));
+    return true;
+}
+
+static void
 nonfinite_generator(float *dst, size_t frames, void *user)
 {
     (void)user;
@@ -861,6 +943,7 @@ test_sink_capture(void)
     pcmmix_options options;
     pcmmix_options_init(&options);
     options.sink_argv = sink_argv;
+    options.channels = 2u;
     options.soft_clip = false;
 
     pcmmix mixer;
@@ -881,26 +964,39 @@ test_sink_capture(void)
         sleep_ms(5);
     CHECK(!pcmmix_voice_active(&mixer, voice));
     sleep_ms(50); /* one more block of trailing silence */
+    pcmmix_stats stats;
+    pcmmix_get_stats(&mixer, &stats);
+    CHECK(stats.rendered_frames > 0u);
+    CHECK(stats.bytes_written > 0u && (stats.bytes_written % 4u) == 0u);
     pcmmix_stop(&mixer);
 
-    /* The captured s16le stream must contain the tone and some of the
-     * silence that is streamed continuously around it. */
+    /* The captured stereo s16le stream must contain centered tone frames and
+     * some of the silence that is streamed continuously around them. */
     FILE *fp = fopen(capture, "rb");
     CHECK(fp != NULL);
     long tone_frames = 0, zero_frames = 0;
-    uint8_t chunk[8192 * 2u];
+    uint8_t chunk[8192 * 4u];
     bool aligned = true;
     size_t got;
     while ((got = fread(chunk, 1u, sizeof chunk, fp)) > 0u) {
-        if ((got & 1u) != 0u) aligned = false;
-        for (size_t i = 0u; i + 1u < got; i += 2u) {
-            const uint16_t raw = (uint16_t)(
+        if ((got & 3u) != 0u) aligned = false;
+        for (size_t i = 0u; i + 3u < got; i += 4u) {
+            const uint16_t raw_left = (uint16_t)(
                 (uint16_t)chunk[i] | ((uint16_t)chunk[i + 1u] << 8));
-            const int32_t frame = raw <= (uint16_t)INT16_MAX ?
-                                  (int32_t)raw : (int32_t)raw - 65536;
+            const uint16_t raw_right = (uint16_t)(
+                (uint16_t)chunk[i + 2u] |
+                ((uint16_t)chunk[i + 3u] << 8));
+            const int32_t left = raw_left <= (uint16_t)INT16_MAX ?
+                                 (int32_t)raw_left :
+                                 (int32_t)raw_left - 65536;
+            const int32_t right = raw_right <= (uint16_t)INT16_MAX ?
+                                  (int32_t)raw_right :
+                                  (int32_t)raw_right - 65536;
 
-            if (frame >= 11998 && frame <= 12002) tone_frames++;
-            else if (frame == 0) zero_frames++;
+            if (left >= 11998 && left <= 12002 && right == left)
+                tone_frames++;
+            else if (left == 0 && right == 0)
+                zero_frames++;
         }
     }
     CHECK(fclose(fp) == 0);
@@ -937,6 +1033,9 @@ test_sink_death_degrades(void)
     CHECK(pcmmix_backend_name(&mixer) == NULL);
     CHECK(strcmp(backend, "sh") == 0); /* immutable until stop */
     CHECK(!pcmmix_is_enabled(&mixer));
+    pcmmix_stats stats;
+    pcmmix_get_stats(&mixer, &stats);
+    CHECK(stats.sink_failures == 1u);
     pcmmix_set_enabled(&mixer, true);
     CHECK(!pcmmix_is_enabled(&mixer));
     CHECK(pcmmix_play(&mixer, &sample, 1.0f, 1.0f) == -1);
@@ -1009,6 +1108,7 @@ main(void)
         {"music crossfade", test_music_crossfade},
         {"music stop fade", test_music_stop_fade},
         {"generator mixed under voices", test_generator_mixed_under_voices},
+        {"stereo generator and stats", test_stereo_generator_and_stats},
         {"nonfinite controls are bounded", test_nonfinite_controls_are_bounded},
         {"SIGPIPE disposition is preserved",
          test_sigpipe_disposition_is_preserved},

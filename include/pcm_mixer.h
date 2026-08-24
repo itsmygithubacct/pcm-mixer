@@ -2,8 +2,9 @@
  *
  * Mixes 16-bit signed mono PCM voices (with linear-interpolation
  * resampling), a two-slot crossfading music layer, and an optional live
- * generator callback, then streams raw s16le down a pipe to a spawned
- * command-line audio sink (pacat, pw-play, aplay, or sox play). The pipe is
+ * mono or interleaved generator callback, then streams raw s16le down a pipe
+ * to a spawned command-line audio sink (pacat, pw-play, aplay, or sox play).
+ * The pipe is
  * shrunk so its capacity is the audio latency and the sink's blocking reads
  * clock the mixer thread. No sink, or the sink dying mid-run, degrades to a
  * silent, safe no-op state instead of failing the host application.
@@ -24,7 +25,7 @@ extern "C" {
 #endif
 
 #define PCMMIX_VERSION_MAJOR 0
-#define PCMMIX_VERSION_MINOR 2
+#define PCMMIX_VERSION_MINOR 3
 #define PCMMIX_VERSION_PATCH 0
 
 /* Hard capacity limits baked into the mixer object. */
@@ -49,13 +50,29 @@ typedef struct pcmmix_sample {
  * the pcmmix API. */
 typedef void (*pcmmix_generator_fn)(float *dst, size_t frames, void *user);
 
+/* Channel-aware generator. `dst` contains `frames * channels` interleaved
+ * float samples, zero-filled on entry. channels is the configured 1 or 2.
+ * The same real-time restrictions as pcmmix_generator_fn apply. */
+typedef void (*pcmmix_generator_interleaved_fn)(float *dst, size_t frames,
+                                                uint32_t channels, void *user);
+
+typedef struct pcmmix_stats {
+    uint64_t rendered_frames;
+    uint64_t bytes_written;
+    uint64_t partial_writes;
+    uint64_t poll_timeouts;
+    uint64_t sink_failures;
+} pcmmix_stats;
+
 typedef struct pcmmix_options {
     uint32_t sample_rate; /* frames per second, 4000..192000; default 44100 */
+    uint32_t channels;    /* interleaved output channels, 1 or 2; default 1 */
     uint32_t max_voices;  /* 1..PCMMIX_VOICES_MAX; default 16 */
     uint32_t latency_ms;  /* transport latency target, 5..1000; default 24 */
-    /* NULL-terminated argv for a custom sink executable that reads s16le
-     * mono PCM from stdin until EOF. NULL selects the built-in probe
-     * (pacat, pw-play, aplay, play). Read only during pcmmix_start(). */
+    /* NULL-terminated argv for a custom sink executable that reads interleaved
+     * s16le PCM with the selected channel count from stdin until EOF. NULL
+     * selects the built-in probe (pacat, pw-play, aplay, play). Read only
+     * during pcmmix_start(). */
     const char *const *sink_argv;
     bool soft_clip; /* tanh master-bus saturation; default true */
     /* Start without a sink or mixer thread; the caller pulls audio with
@@ -83,12 +100,14 @@ typedef struct pcmmix_music_voice {
 
 typedef struct pcmmix {
     /* private: use the API below */
-    uint32_t sample_rate, max_voices, latency_ms, block_frames;
+    uint32_t sample_rate, channels, max_voices, latency_ms, block_frames;
     bool soft_clip, offline;
     pcmmix_voice voices[PCMMIX_VOICES_MAX];
     pcmmix_music_voice music[PCMMIX_MUSIC_SLOTS];
     pcmmix_generator_fn generator;
+    pcmmix_generator_interleaved_fn interleaved_generator;
     void *generator_user;
+    pcmmix_stats stats;
     pthread_mutex_t lock;
     pthread_t thread;
     bool thread_started;
@@ -132,6 +151,13 @@ bool pcmmix_is_running(pcmmix *mixer);
  * the mixer is offline, stopped, never started, or the sink has died. A
  * non-NULL pointer and its immutable text remain valid until pcmmix_stop(). */
 const char *pcmmix_backend_name(pcmmix *mixer);
+
+/* Configured interleaved channel count, or zero before start/after stop. */
+uint32_t pcmmix_channels(pcmmix *mixer);
+
+/* Coherent counters accumulated by the current successful start. Returns
+ * zeros before start and after stop. */
+void pcmmix_get_stats(pcmmix *mixer, pcmmix_stats *out);
 
 /* Master mute. Disabling silences and clears all voices and music
  * immediately, and rejects new play/loop/music calls until re-enabled.
@@ -191,13 +217,19 @@ const int16_t *pcmmix_music_current(pcmmix *mixer);
  * while the mixer is running; the swap is atomic with respect to mixing. */
 void pcmmix_set_generator(pcmmix *mixer, pcmmix_generator_fn fn, void *user);
 
+/* Install a channel-aware generator and clear the legacy mono generator.
+ * Passing fn == NULL clears both generator forms. */
+void pcmmix_set_generator_interleaved(
+    pcmmix *mixer, pcmmix_generator_interleaved_fn fn, void *user);
+
 /* --- offline rendering ------------------------------------------------ */
 
 /* Render `frames` frames of the master mix into dst, advancing all voice,
  * music, and generator state. This is the exact fill the transport thread
  * streams to the sink; call it yourself only on an offline mixer (unit
- * tests, bounce-to-disk). A transport-backed mixer returns silence here
- * instead of advancing live voice state from the wrong thread. */
+ * tests, bounce-to-disk). `dst` has `frames * pcmmix_channels()` interleaved
+ * samples. A transport-backed mixer returns silence instead of advancing live
+ * voice state from the wrong thread. */
 void pcmmix_mix_block(pcmmix *mixer, int16_t *dst, size_t frames);
 
 /* --- WAV loading ------------------------------------------------------ */

@@ -181,37 +181,58 @@ static int16_t mix_to_s16(float sample)
 
 static void mix_chunk_locked(pcmmix *m, int16_t *dst, size_t frames)
 {
-    float mix[CHUNK_CAP];
+    float mono[CHUNK_CAP];
+    float mix[CHUNK_CAP * 2u];
+    const size_t samples = frames * m->channels;
 
     if (!m->enabled) {
-        memset(dst, 0, frames * sizeof dst[0]);
+        memset(dst, 0, samples * sizeof dst[0]);
+        m->stats.rendered_frames += frames;
         return;
     }
-    bool have_source = m->generator != NULL;
+    bool have_source = m->generator != NULL ||
+                       m->interleaved_generator != NULL;
     for (uint32_t index = 0u; index < m->max_voices && !have_source; ++index)
         have_source = m->voices[index].active;
     for (uint32_t index = 0u;
          index < PCMMIX_MUSIC_SLOTS && !have_source; ++index)
         have_source = m->music[index].active;
     if (!have_source) {
-        memset(dst, 0, frames * sizeof dst[0]);
+        memset(dst, 0, samples * sizeof dst[0]);
+        m->stats.rendered_frames += frames;
         return;
     }
-    memset(mix, 0, frames * sizeof mix[0]);
+    memset(mono, 0, frames * sizeof mono[0]);
+    memset(mix, 0, samples * sizeof mix[0]);
     for (uint32_t i = 0; i < m->max_voices; i++)
-        mix_voice(&m->voices[i], mix, frames);
+        mix_voice(&m->voices[i], mono, frames);
     for (uint32_t i = 0; i < PCMMIX_MUSIC_SLOTS; i++)
-        mix_music(&m->music[i], mix, frames);
+        mix_music(&m->music[i], mono, frames);
+    for (size_t frame = 0u; frame < frames; ++frame) {
+        for (uint32_t channel = 0u; channel < m->channels; ++channel)
+            mix[frame * m->channels + channel] = mono[frame];
+    }
     if (m->generator) {
         float gen[CHUNK_CAP];
         memset(gen, 0, frames * sizeof gen[0]);
         m->generator(gen, frames, m->generator_user);
-        for (size_t i = 0; i < frames; i++) mix[i] += gen[i];
+        for (size_t frame = 0u; frame < frames; ++frame) {
+            for (uint32_t channel = 0u; channel < m->channels; ++channel)
+                mix[frame * m->channels + channel] += gen[frame];
+        }
+    } else if (m->interleaved_generator) {
+        float gen[CHUNK_CAP * 2u];
+        memset(gen, 0, samples * sizeof gen[0]);
+        m->interleaved_generator(gen, frames, m->channels,
+                                 m->generator_user);
+        for (size_t sample = 0u; sample < samples; ++sample)
+            mix[sample] += gen[sample];
     }
-    for (size_t i = 0; i < frames; i++) {
-        const float sample = m->soft_clip ? tanhf(mix[i]) : mix[i];
-        dst[i] = mix_to_s16(sample);
+    for (size_t index = 0u; index < samples; ++index) {
+        const float sample = m->soft_clip ? tanhf(mix[index]) : mix[index];
+        dst[index] = mix_to_s16(sample);
     }
+    m->stats.rendered_frames += frames;
 }
 
 static void silence_all_locked(pcmmix *m)
@@ -379,7 +400,7 @@ static bool spawn_sink_argv(pcmmix *m, const char *const *argv)
          * the default 64 KiB of mono s16 at 44.1 kHz would be ~740 ms of
          * lag between a cue and the speaker. */
         uint64_t bytes = (uint64_t)m->sample_rate * m->latency_ms / 1000u *
-                         sizeof(int16_t);
+                         m->channels * sizeof(int16_t);
         if (bytes < 4096u) bytes = 4096u;
         if (bytes > (1u << 20)) bytes = 1u << 20;
         if (fcntl(pfd[1], F_SETPIPE_SZ, (int)bytes) >= 0)
@@ -415,21 +436,24 @@ static bool spawn_sink_argv(pcmmix *m, const char *const *argv)
 
 static bool spawn_probe(pcmmix *m)
 {
+    char channel_eq[24], channel_num[12];
     char latency_arg[32], rate_eq[32], rate_num[16];
     snprintf(latency_arg, sizeof latency_arg, "--latency-msec=%u",
              m->latency_ms);
     snprintf(rate_eq, sizeof rate_eq, "--rate=%u", m->sample_rate);
     snprintf(rate_num, sizeof rate_num, "%u", m->sample_rate);
+    snprintf(channel_eq, sizeof channel_eq, "--channels=%u", m->channels);
+    snprintf(channel_num, sizeof channel_num, "%u", m->channels);
 
     const char *pacat_argv[] = { "pacat", "--raw", latency_arg, rate_eq,
-                                 "--channels=1", "--format=s16le", NULL };
-    const char *pw_argv[] = { "pw-play", "--raw", rate_eq, "--channels=1",
+                                 channel_eq, "--format=s16le", NULL };
+    const char *pw_argv[] = { "pw-play", "--raw", rate_eq, channel_eq,
                               "--format=s16", "-", NULL };
     const char *aplay_argv[] = { "aplay", "-q", "-t", "raw", "-f", "S16_LE",
-                                 "-r", rate_num, "-c", "1",
+                                 "-r", rate_num, "-c", channel_num,
                                  "-B", "30000", "-F", "10000", NULL };
     const char *play_argv[] = { "play", "-q", "-t", "raw", "-r", rate_num,
-                                "-e", "signed", "-b", "16", "-c", "1", "-",
+                                "-e", "signed", "-b", "16", "-c", channel_num, "-",
                                 NULL };
     const char *const *candidates[] = { pacat_argv, pw_argv, aplay_argv,
                                         play_argv };
@@ -467,7 +491,12 @@ static bool write_block(pcmmix *m, const void *block, size_t bytes)
         struct pollfd sink = {m->sink_fd, POLLOUT, 0};
         int rc = poll(&sink, 1u, timeout);
 
-        if (rc == 0) continue;
+        if (rc == 0) {
+            pthread_mutex_lock(&m->lock);
+            m->stats.poll_timeouts++;
+            pthread_mutex_unlock(&m->lock);
+            continue;
+        }
         if (rc < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -481,6 +510,10 @@ static bool write_block(pcmmix *m, const void *block, size_t bytes)
             return false;
         }
         if (n == 0) return false;
+        pthread_mutex_lock(&m->lock);
+        m->stats.bytes_written += (uint64_t)n;
+        if ((size_t)n < left) m->stats.partial_writes++;
+        pthread_mutex_unlock(&m->lock);
         p += (size_t)n;
         left -= (size_t)n;
         deadline = monotonic_milliseconds() + SINK_STALL_MS;
@@ -490,15 +523,16 @@ static bool write_block(pcmmix *m, const void *block, size_t bytes)
 
 static bool write_pcm_block(pcmmix *m, const int16_t *block, size_t frames)
 {
-    uint8_t little_endian[CHUNK_CAP * sizeof block[0]];
+    uint8_t little_endian[CHUNK_CAP * 2u * sizeof block[0]];
+    const size_t samples = frames * m->channels;
 
-    for (size_t index = 0u; index < frames; ++index) {
+    for (size_t index = 0u; index < samples; ++index) {
         const uint16_t sample = (uint16_t)block[index];
 
         little_endian[index * 2u] = (uint8_t)(sample & UINT16_C(0xff));
         little_endian[index * 2u + 1u] = (uint8_t)(sample >> 8);
     }
-    return write_block(m, little_endian, frames * sizeof block[0]);
+    return write_block(m, little_endian, samples * sizeof block[0]);
 }
 
 static bool sink_exited(pcmmix *m)
@@ -521,6 +555,7 @@ static void transport_fail(pcmmix *m)
     m->sink_alive = false;
     m->enabled = false;
     m->running = false;
+    m->stats.sink_failures++;
     silence_all_locked(m);
     pthread_mutex_unlock(&m->lock);
     reap_sink(m);
@@ -529,7 +564,7 @@ static void transport_fail(pcmmix *m)
 static void *mixer_thread_main(void *arg)
 {
     pcmmix *m = arg;
-    int16_t out[CHUNK_CAP];
+    int16_t out[CHUNK_CAP * 2u];
     const size_t frames = m->block_frames;
     const long block_ms =
         (long)((uint64_t)frames * 1000u / m->sample_rate) + 1;
@@ -571,6 +606,7 @@ void pcmmix_options_init(pcmmix_options *options)
 {
     if (!options) return;
     options->sample_rate = 44100u;
+    options->channels = 1u;
     options->max_voices = 16u;
     options->latency_ms = 24u;
     options->sink_argv = NULL;
@@ -592,6 +628,8 @@ bool pcmmix_start(pcmmix *m, const pcmmix_options *options)
 
     m->sample_rate = options->sample_rate ? options->sample_rate : 44100u;
     if (m->sample_rate < 4000u || m->sample_rate > 192000u) return false;
+    m->channels = options->channels ? options->channels : 1u;
+    if (m->channels < 1u || m->channels > 2u) return false;
     m->max_voices = options->max_voices ? options->max_voices : 16u;
     if (m->max_voices > PCMMIX_VOICES_MAX) return false;
     m->latency_ms = options->latency_ms ? options->latency_ms : 24u;
@@ -669,6 +707,22 @@ const char *pcmmix_backend_name(pcmmix *m)
     const char *name = m->sink_alive ? m->backend : NULL;
     pthread_mutex_unlock(&m->lock);
     return name;
+}
+
+uint32_t pcmmix_channels(pcmmix *m)
+{
+    if (!m || !m->started) return 0u;
+    return m->channels;
+}
+
+void pcmmix_get_stats(pcmmix *m, pcmmix_stats *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    if (!m || !m->started) return;
+    pthread_mutex_lock(&m->lock);
+    *out = m->stats;
+    pthread_mutex_unlock(&m->lock);
 }
 
 void pcmmix_set_enabled(pcmmix *m, bool on)
@@ -887,6 +941,18 @@ void pcmmix_set_generator(pcmmix *m, pcmmix_generator_fn fn, void *user)
     if (!m || !m->started) return;
     pthread_mutex_lock(&m->lock);
     m->generator = fn;
+    m->interleaved_generator = NULL;
+    m->generator_user = fn ? user : NULL;
+    pthread_mutex_unlock(&m->lock);
+}
+
+void pcmmix_set_generator_interleaved(
+    pcmmix *m, pcmmix_generator_interleaved_fn fn, void *user)
+{
+    if (!m || !m->started) return;
+    pthread_mutex_lock(&m->lock);
+    m->generator = NULL;
+    m->interleaved_generator = fn;
     m->generator_user = fn ? user : NULL;
     pthread_mutex_unlock(&m->lock);
 }
@@ -894,9 +960,12 @@ void pcmmix_set_generator(pcmmix *m, pcmmix_generator_fn fn, void *user)
 void pcmmix_mix_block(pcmmix *m, int16_t *dst, size_t frames)
 {
     if (!m || !dst || frames == 0) return;
-    if (frames > SIZE_MAX / sizeof(int16_t)) return;
+    uint32_t channels = m->started &&
+                        (m->channels == 1u || m->channels == 2u)
+                            ? m->channels : 1u;
+    if (frames > SIZE_MAX / channels / sizeof(int16_t)) return;
     if (!m->started || !m->offline) {
-        memset(dst, 0, frames * sizeof(int16_t));
+        memset(dst, 0, frames * channels * sizeof(int16_t));
         return;
     }
     pthread_mutex_lock(&m->lock);
@@ -904,7 +973,7 @@ void pcmmix_mix_block(pcmmix *m, int16_t *dst, size_t frames)
     while (done < frames) {
         size_t n = frames - done;
         if (n > CHUNK_CAP) n = CHUNK_CAP;
-        mix_chunk_locked(m, dst + done, n);
+        mix_chunk_locked(m, dst + done * m->channels, n);
         done += n;
     }
     pthread_mutex_unlock(&m->lock);
