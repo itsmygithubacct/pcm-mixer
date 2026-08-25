@@ -66,13 +66,14 @@ typedef struct pcmmix_stats {
 
 typedef struct pcmmix_options {
     uint32_t sample_rate; /* frames per second, 4000..192000; default 44100 */
-    uint32_t channels;    /* interleaved output channels, 1 or 2; default 1 */
     uint32_t max_voices;  /* 1..PCMMIX_VOICES_MAX; default 16 */
     uint32_t latency_ms;  /* transport latency target, 5..1000; default 24 */
-    /* NULL-terminated argv for a custom sink executable that reads interleaved
-     * s16le PCM with the selected channel count from stdin until EOF. NULL
-     * selects the built-in probe (pacat, pw-play, aplay, play). Read only
-     * during pcmmix_start(). */
+    /* Interleaved output channels: 1 (backward-compatible default) or 2. */
+    uint32_t output_channels;
+    /* NULL-terminated argv for a custom sink executable that reads s16le
+     * PCM from stdin until EOF, with output_channels channels. NULL selects
+     * the built-in probe
+     * (pacat, pw-play, aplay, play). Read only during pcmmix_start(). */
     const char *const *sink_argv;
     bool soft_clip; /* tanh master-bus saturation; default true */
     /* Start without a sink or mixer thread; the caller pulls audio with
@@ -85,7 +86,7 @@ typedef struct pcmmix_options {
 typedef struct pcmmix_voice {
     const int16_t *data;
     size_t frame_count;
-    float pos, step, vol;
+    float pos, step, vol, pan;
     uint32_t generation;
     bool active, looping;
 } pcmmix_voice;
@@ -100,7 +101,8 @@ typedef struct pcmmix_music_voice {
 
 typedef struct pcmmix {
     /* private: use the API below */
-    uint32_t sample_rate, channels, max_voices, latency_ms, block_frames;
+    uint32_t sample_rate, max_voices, latency_ms, block_frames;
+    uint32_t output_channels;
     bool soft_clip, offline;
     pcmmix_voice voices[PCMMIX_VOICES_MAX];
     pcmmix_music_voice music[PCMMIX_MUSIC_SLOTS];
@@ -177,17 +179,25 @@ bool pcmmix_is_enabled(pcmmix *mixer);
  * layer for long material. */
 int pcmmix_play(pcmmix *mixer, const pcmmix_sample *sample, float vol,
                 float pitch);
+/* Stereo-positioned form. pan is clamped to -1 (left)..1 (right); NaN is
+ * center. A deterministic linear law is used. Mono output ignores pan. */
+int pcmmix_play_pan(pcmmix *mixer, const pcmmix_sample *sample, float vol,
+                    float pitch, float pan);
 
 /* Like pcmmix_play() but the voice loops seamlessly (last frame
  * interpolates back into the first) until pcmmix_voice_stop(). */
 int pcmmix_loop(pcmmix *mixer, const pcmmix_sample *sample, float vol,
                 float pitch);
+int pcmmix_loop_pan(pcmmix *mixer, const pcmmix_sample *sample, float vol,
+                    float pitch, float pan);
 
 /* Live-adjust a voice's gain and pitch (thrust/engine style control).
  * Handles are generation-checked: a stale handle whose slot has been
  * recycled is rejected. Returns false when the handle no longer names a
  * live voice. */
 bool pcmmix_voice_set(pcmmix *mixer, int voice, float vol, float pitch);
+bool pcmmix_voice_set_pan(pcmmix *mixer, int voice, float vol, float pitch,
+                          float pan);
 
 /* Stop a voice immediately. Returns false for stale or finished handles. */
 bool pcmmix_voice_stop(pcmmix *mixer, int voice);
@@ -224,7 +234,8 @@ void pcmmix_set_generator_interleaved(
 
 /* --- offline rendering ------------------------------------------------ */
 
-/* Render `frames` frames of the master mix into dst, advancing all voice,
+/* Render `frames` frames (frames * output_channels samples) of the master
+ * mix into interleaved dst, advancing all voice,
  * music, and generator state. This is the exact fill the transport thread
  * streams to the sink; call it yourself only on an offline mixer (unit
  * tests, bounce-to-disk). `dst` has `frames * pcmmix_channels()` interleaved
