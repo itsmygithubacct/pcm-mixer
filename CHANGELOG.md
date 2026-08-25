@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 - 2026-08-25
+
+- Add an optional control-thread asset library for WAV, OGG, SFZ, and SF2.
+- Normalize decoded assets to owned mono signed 16-bit PCM at a caller-selected
+  rate while preserving the dependency-free realtime mixer.
+- Bound input sizes, durations, SFZ paths, and SF2 render durations.
+
 ## 0.3.0 - 2026-08-24
 
 - Add optional two-channel interleaved transport and a channel-aware generator

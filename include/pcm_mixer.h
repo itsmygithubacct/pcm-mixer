@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define PCMMIX_VERSION_MAJOR 0
-#define PCMMIX_VERSION_MINOR 3
+#define PCMMIX_VERSION_MINOR 4
 #define PCMMIX_VERSION_PATCH 0
 
 /* Hard capacity limits baked into the mixer object. */
