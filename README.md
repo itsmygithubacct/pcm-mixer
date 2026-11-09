@@ -1,37 +1,39 @@
 # pcm-mixer
 
-`pcm-mixer` is a small C11 library that gives terminal games and applications
-sound without an audio dependency. It software-mixes 16-bit mono PCM voices on
-a background thread and streams mono or stereo interleaved s16le down a pipe
-to the first available command-line sink (`pacat`, `pw-play`, `aplay`, or sox
-`play`). It
-consolidates the audio layer shared by the terminal-lander / chess-bash
-family of terminal games.
+`pcm-mixer` is a small C11 library that mixes game sound on a background thread
+and streams it as s16le PCM to a command-line audio player (`pacat`, `pw-play`,
+`aplay` or sox `play`), so a terminal game gets audio without an audio library.
 
-The mixer provides pitch-shifted one-shots with voice stealing, held loops
-with live volume/pitch control, a crossfading two-slot music layer, a
-generator callback for live synthesis, a strict diagnostic WAV loader, and
-an ownership-aware cue/variant bank, and an offline mode for tests and
-bounce-to-disk rendering. It requires POSIX and pthreads; there are no other
-dependencies.
+It is not installed on its own. Kilix games and apps pin it as a Git submodule
+(most of them through
+[kilix-game-sdk](https://github.com/itsmygithubacct/kilix-game-sdk#readme)) and
+compile it into their binaries; those games and apps install on demand from the
+Kilix content catalog.
 
-## Build and test
+## What it does
 
-```sh
-make
-make test
-make sanitize
-make tsanitize
-make benchmark
-./build/beep
-```
-
-The final command plays an audible test tone through the default sink
-probe. The test suite is silent: it renders offline and captures transport
-output through `cat`, and never spawns a real audio player.
-The sanitizer targets repeat it under ASan/UBSan and ThreadSanitizer.
+- Plays pitch-shifted one-shots with voice stealing and held loops whose volume
+  and pitch can change live.
+- Crossfades music between two slots and fades it out on request.
+- Runs a generator callback for live synthesis, mono or interleaved stereo.
+- Outputs mono by default or interleaved stereo with a linear pan law.
+- Groups samples into a cue and variant bank (64 cues, eight variants each) with
+  ownership tracking and no immediate random repeats.
+- Loads strict 16-bit mono 44100 Hz WAV files, and, through an optional separate
+  library, WAV, OGG Vorbis, SFZ regions and SF2 presets.
+- Renders offline with no sink and no thread, for tests and bounce-to-disk.
+- Needs only POSIX and pthreads; the optional asset layer adds libsndfile and
+  FluidSynth.
 
 ## Quick start
+
+```sh
+git clone https://github.com/itsmygithubacct/pcm-mixer.git
+cd pcm-mixer
+make            # build/libpcm-mixer.a, build/libpcm-mixer.so, build/beep
+make test       # silent: renders offline, never starts a real player
+./build/beep    # plays an audible test tone through the first working sink
+```
 
 ```c
 #include "pcm_mixer.h"
@@ -39,231 +41,105 @@ The sanitizer targets repeat it under ASan/UBSan and ThreadSanitizer.
 pcmmix mixer;
 pcmmix_options options;
 pcmmix_options_init(&options);
-
 if (!pcmmix_start(&mixer, &options)) {
-    /* No sink available: run the game silently. */
+    /* no sink available: carry on silently */
 }
-
-char err[256];
-size_t frames = 0;
-int16_t *pcm = pcmmix_wav_load("assets/sfx/explosion.wav", &frames,
-                               err, sizeof err);
-pcmmix_sample explosion = { pcm, frames };
-
-pcmmix_play(&mixer, &explosion, 0.8f, 1.0f);          /* fire and forget */
-
-int engine = pcmmix_loop(&mixer, &engine_sample, 0.5f, 1.0f);
-pcmmix_voice_set(&mixer, engine, 0.7f, 1.4f);         /* rev it live */
-pcmmix_voice_stop(&mixer, engine);
-
-pcmmix_music_play(&mixer, &battle_theme, 1.0f, true); /* crossfades in */
-pcmmix_music_stop(&mixer, 2.0f);
-
+pcmmix_play(&mixer, &explosion, 0.8f, 1.0f);   /* explosion: a pcmmix_sample */
 pcmmix_stop(&mixer);
-pcmmix_wav_free(pcm);   /* samples are caller-owned; free after stop */
 ```
 
-Output remains mono by default for source and custom-sink compatibility. Set
-`options.output_channels = 2` to request interleaved stereo, then use
-`pcmmix_play_pan()` or `pcmmix_loop_pan()`. Pan is clamped to `[-1, 1]` and
-uses a deterministic linear law: center feeds both channels at full gain;
-hard left/right silences the opposite channel. Mono output intentionally
-ignores pan. Existing play, loop, and voice-set calls remain centered.
+A program may instead compile `src/pcm_mixer.c`, `src/pcm_wav.c` and
+`src/pcmmix_bank.c` directly.
 
-## Cue and variant bank
+## Usage
 
-`pcmmix_bank` replaces the sample arrays, WAV ownership loops, and random
-variant selection that games otherwise repeat. It stores up to 64 cues with
-eight variants each, can borrow generated PCM or own loaded/allocated PCM,
-avoids immediate random repeats, and applies per-variant gain and pitch.
+| Area | Main calls |
+|---|---|
+| Lifecycle | `pcmmix_options_init`, `pcmmix_start`, `pcmmix_stop`, `pcmmix_is_running`, `pcmmix_backend_name`, `pcmmix_get_stats` |
+| Voices | `pcmmix_play`, `pcmmix_play_pan`, `pcmmix_loop`, `pcmmix_loop_pan`, `pcmmix_voice_set`, `pcmmix_voice_stop`, `pcmmix_voice_active` |
+| Music | `pcmmix_music_play`, `pcmmix_music_stop`, `pcmmix_music_current` |
+| Synthesis | `pcmmix_set_generator`, `pcmmix_set_generator_interleaved` |
+| Samples | `pcmmix_wav_load`, `pcmmix_wav_free` |
+| Cue bank (`pcmmix_bank.h`) | `pcmmix_bank_init`, `pcmmix_bank_load_variants`, `pcmmix_bank_take`, `pcmmix_bank_set_borrowed`, `pcmmix_bank_play`, `pcmmix_bank_clear` |
+| Offline | `options.offline = true`, then `pcmmix_mix_block` |
+| Assets (`pcmmix_asset.h`, optional) | `pcmmix_asset_load`, `pcmmix_asset_free` |
 
-```c
-#include "pcmmix_bank.h"
+| Make target | What it does |
+|---|---|
+| `make` | static and shared libraries plus the `beep` example |
+| `make test` | mixer and bank tests, offline and silent |
+| `make sanitize`, `make tsanitize` | the tests under ASan/UBSan and under ThreadSanitizer |
+| `make benchmark` | mixer and WAV-loader microbenchmarks |
+| `make assets test-assets` | the optional asset library and its tests |
+| `make install PREFIX=/usr/local`, `make install-assets` | install the libraries and headers |
 
-pcmmix_bank bank;
-pcmmix_bank_init(&bank, SFX_COUNT, 0x1234u);
-pcmmix_bank_load_variants(&bank, SFX_HIT, hit_paths, hit_path_count,
-                          0.8f, 1.0f, error, sizeof error);
-pcmmix_bank_play(&mixer, &bank, SFX_HIT, 1.0f, 1.0f);
+## How it works
 
-pcmmix_stop(&mixer);   /* no voice may still reference bank memory */
-pcmmix_bank_clear(&bank);
+```
+ game thread                          mixer thread
+ ───────────                          ────────────
+ pcmmix_play / loop / music ──lock──▶ voices + music slots + generator
+                                       │ mix, pitch-resample, soft clip
+                                       ▼
+                                 s16le blocks ──pipe──▶ pacat | pw-play | aplay | play
 ```
 
-Variant loading is transactional: if any path fails, the cue's previous
-samples remain intact. `pcmmix_bank_take()` transfers a malloc-compatible
-generated buffer only on success; `pcmmix_bank_set_borrowed()` leaves
-ownership with the caller. A frame pointer may be borrowed by more than one
-slot, but it may be owned by only one; attempts to create an ownership alias
-are rejected without changing the bank. Bank mutation and cleanup are
-control-thread operations and must not race playback or precede mixer
-shutdown.
+`pcmmix_start()` probes the four players in order and starts the first one on
+`PATH` that is still alive after about 80 ms, using `posix_spawnp()` with its
+stdin connected to a close-on-exec pipe. On Linux the pipe is shrunk to about
+`latency_ms` of audio and the mixer writes continuously, silence included, so
+the player's blocking reads pace the mixer at a fixed latency. If the player
+dies or stalls, the mixer winds down into a silent state and every playback call
+becomes a no-op; the game keeps running. `pcmmix_stop()` reaps the player.
 
-## Transport
+Samples belong to the caller: the mixer never copies or frees PCM. Handles are
+generation-checked, so a stale voice handle cannot adjust a recycled slot. The
+master bus soft-clips with `tanh` unless hard clipping is requested.
 
-The stream contract is signed 16-bit little-endian at the configured sample
-rate (default 44100 Hz) and channel count (one by default, optionally two).
-`pcmmix_start()` probes for
-sinks in this order and uses `posix_spawnp()` for the first executable on
-`PATH` that survives an ~80 ms liveness window (a sink with no server to
-talk to exits immediately):
+Depth: [docs/transport.md](docs/transport.md) for the sink and latency model,
+[docs/api.md](docs/api.md) for voices, music, the generator hook, the WAV
+loader, the bank, offline rendering and the threading contract.
 
-1. `pacat` (PulseAudio)
-2. `pw-play` (PipeWire)
-3. `aplay` (ALSA)
-4. `play` (sox)
+## Documentation
 
-The sink reads explicitly encoded little-endian PCM from a close-on-exec
-pipe mapped to its stdin; its stdout/stderr are sent to `/dev/null` so sink
-chatter cannot land in the host's terminal UI. `options.sink_argv` replaces
-the probe with a custom NULL-terminated argv, which is also how integration
-tests capture the stream (`sh -c 'cat > file'`).
+- [docs/api.md](docs/api.md): the API guide, from the quick start to the
+  threading contract.
+- [docs/transport.md](docs/transport.md): sink probing, the pipe-paced latency
+  model and sink failure.
+- [docs/building.md](docs/building.md): build, test, sanitizer, benchmark,
+  install and optional asset-layer targets.
+- [CHANGELOG.md](CHANGELOG.md): release history.
 
-The latency model: on Linux the pipe is shrunk with `F_SETPIPE_SZ` to about
-`latency_ms` worth of audio, the mixer streams continuously — silence
-included — so the pipe runs full, and the sink's blocking reads then clock
-the mixer thread at a fixed latency with no underruns. Where
-`F_SETPIPE_SZ` is unavailable the mixer falls back to sleep-based pacing,
-at the cost of a larger pipe buffer. The write end remains nonblocking and
-`poll()` uses a monotonic no-progress deadline, so large descriptor numbers,
-signals, partial writes, and a wedged sink cannot make shutdown hang.
+## Related repositories
 
-Only the mixer thread blocks `SIGPIPE`; the host process's signal disposition
-is not changed. A sink that dies mid-run (write error, exit, or a
-multi-second stall) winds the mixer down into a silent state:
-`pcmmix_is_running()` returns false, `pcmmix_backend_name()` returns NULL,
-the enabled flag clears, and every playback call becomes a safe no-op that
-cannot revive the dead transport. A previously returned backend-name pointer
-remains valid until `pcmmix_stop()`. The game keeps running, just silently.
-`pcmmix_stop()` is still required and reaps the sink, escalating to SIGTERM
-then SIGKILL if it will not exit.
+Projects that pin `pcm-mixer`:
 
-## Voices
+- [kilix-game-sdk](https://github.com/itsmygithubacct/kilix-game-sdk#readme)
+  pins it at `kilix-game-kit/third_party/pcm-mixer`, and `kilix-game-kit`'s
+  audio layer (`kilix_game_audio.h`) is built on it. Games on the SDK get their
+  sound through it: the games in
+  [kilix-games](https://github.com/itsmygithubacct/kilix-games#readme),
+  [pleb-tower](https://github.com/itsmygithubacct/pleb-tower#readme),
+  [super-kilix](https://github.com/itsmygithubacct/super-kilix#readme),
+  [pleb-plant-grower](https://github.com/itsmygithubacct/pleb-plant-grower#readme)
+  and [kilix-land](https://github.com/itsmygithubacct/kilix-land#readme).
+- [kilix-techno](https://github.com/itsmygithubacct/kilix-techno#readme) pins it
+  directly at `third_party/pcm-mixer`.
 
-Samples are caller-owned (`pcmmix_sample` is a pointer plus a frame count);
-the mixer never copies or frees PCM, so the memory must stay valid until no
-voice references it. `pcmmix_play()` starts a one-shot and `pcmmix_loop()`
-a seamless loop, both with a linear gain and a resampling pitch ratio
-(linear interpolation). They return a voice handle usable with
-`pcmmix_voice_set()` (live gain/pitch, the thrust-and-engine control path),
-`pcmmix_voice_stop()`, and `pcmmix_voice_active()`.
+[chip-sequencer](https://github.com/itsmygithubacct/chip-sequencer#readme)
+renders chiptune music into one of this mixer's generator slots.
 
-When every slot is busy, the most-finished one-shot is stolen; looping
-voices are never stolen. Handles are generation-checked, so a stale handle
-whose slot has been recycled is rejected instead of adjusting the wrong
-voice. Non-finite controls are normalized before they reach the resampler,
-and a one-shot becomes inactive in the same block that consumes its final
-frame.
+## Part of Plebian-OS
 
-The master bus applies `tanh` soft-clipping by default
-(`options.soft_clip = false` selects hard clipping over the full signed
-16-bit range, which tests use for sample-exact output).
-
-## Music
-
-`pcmmix_music_play()` plays a track at 1.0 pitch and automatically
-crossfades (0.5 s) from whatever is playing: the old track fades out while
-the new one fades in on the second slot. Calling it again with the track
-that is already playing just retargets its volume and loop flag. Tracks
-are identified by their frames pointer. `pcmmix_music_stop(fade_seconds)`
-fades everything to silence, and `pcmmix_music_current()` reports the
-frames pointer of the track currently playing or fading in.
-
-## Generator hook
-
-`pcmmix_set_generator()` installs a mono block callback for live synthesis —
-engine drones tied to game state, procedural music — that would be awkward
-to express as baked samples:
-
-```c
-void engines(float *dst, size_t frames, void *user);
-pcmmix_set_generator(&mixer, engines, &game);
-```
-
-The callback receives a zero-filled float buffer, writes samples in
-[-1, 1], and the result is added to the mix. It runs on the mixer thread
-with the mixer lock held: it must be fast and lock-free, must not block,
-and must not call back into the pcmmix API.
-
-For a stereo source, set `options.output_channels = 2` and install
-`pcmmix_set_generator_interleaved()`. Its zero-filled buffer contains
-`frames * channels` samples in frame-major order. Existing mono clips, music,
-and legacy generators are centered into both output channels. The selected
-channel count is passed to every built-in sink and is included in pipe-latency
-accounting. `pcmmix_get_stats()` reports coherent rendered-frame, write,
-timeout, and sink-failure counters.
-
-## WAV loader
-
-`pcmmix_wav_load()` is deliberately strict: PCM, mono, 16-bit, 44100 Hz
-only. An asset that does not match is a bug in whatever generated it, and
-silently resampling would hide that. Failures return NULL with a
-human-readable reason (`"sfx/hit.wav is 2ch/16bit/44100Hz, expected
-1ch/16bit/44100Hz"`) written into the caller's error buffer. The parser
-streams RIFF chunks within the declared RIFF boundary, validates chunk
-padding, duplicate format/data chunks, PCM byte rate and block alignment,
-and even sample-byte counts rather than assuming a canonical 44-byte
-header. Files are capped at 64 MiB, and only the decoded output buffer is
-allocated.
-
-## Offline rendering and testing
-
-`options.offline = true` starts the mixer with no sink and no thread; the
-caller pulls the master mix with `pcmmix_mix_block()`, which renders the
-exact fill the transport thread would stream. This is how the unit tests
-assert on mixer output without any audio hardware, and it doubles as a
-bounce-to-disk path. For transport-level tests, `options.sink_argv` can
-point at any PCM-consuming command. Calling `pcmmix_mix_block()` on a
-transport-backed mixer returns silence without advancing live voice, music,
-or generator state.
-
-## Performance checks
-
-`make benchmark` builds deterministic mixer and WAV-loader microbenchmarks.
-The mixer benchmark covers idle output, unity-pitch and resampled voices,
-soft and hard clipping, a saturated 16-voice mix, and bank selection. The
-WAV benchmark generates and repeatedly loads a strict fixture. Results are
-reported as nanoseconds per frame, choice, or input byte so changes can be
-compared on the same host; they are measurements, not pass/fail tests.
-
-## Threading contract
-
-`pcmmix_start()` and `pcmmix_stop()` belong to one control thread;
-`pcmmix_stop()` must not race other calls, and after it returns nothing
-touches the mixer object or sample memory. All other calls are
-thread-safe against the mixer thread and each other. The generator
-callback runs on the mixer thread. `pcmmix_mix_block()` is for offline
-mixers; an accidental transport-mode call is safe but produces silence.
-
-## Install
-
-```sh
-make install PREFIX=/usr/local
-```
-
-The build produces static and shared libraries. Applications may instead
-compile `src/pcm_mixer.c`, `src/pcm_wav.c`, and `src/pcmmix_bank.c` directly.
-The library has no dependencies beyond the C and POSIX system libraries.
-
-An optional control-thread asset layer accepts WAV, OGG Vorbis, bounded SFZ
-regions, and SF2 presets while keeping codecs and allocation out of the mixer:
-
-```sh
-make assets test-assets
-```
-
-`pcmmix_asset_load()` normalizes the selected asset to owned mono signed
-16-bit PCM at the requested rate. It uses libsndfile for WAV/OGG and
-FluidSynth for a bounded SF2 note render; the small SFZ resolver supports the
-key, velocity, root-key, `default_path`, and relative sample opcodes needed by
-curated banks. Link `libpcm-mixer-assets` with the `sndfile` and `fluidsynth`
-pkg-config dependencies. The realtime mixer remains dependency-free when the
-optional layer is not built.
-
-The API is pre-1.0 and may change between minor releases. Version 0.3.0 adds
-optional stereo transport, interleaved generation, and transport statistics
-without changing mono defaults. Version 0.4.0 adds the separate bounded audio
-asset layer without changing the core library ABI.
+pcm-mixer is one of the repositories behind
+[Plebian-OS](https://github.com/itsmygithubacct/plebian-os#readme), a Debian
+install whose desktop is [Kilix](https://github.com/itsmygithubacct/kilix#readme)
+running the [Kilix 95](https://github.com/itsmygithubacct/kilix-95#readme)
+desktop through [Pleb](https://github.com/itsmygithubacct/pleb#readme).
+It reaches a user compiled into the Kilix games and apps that pin it, which
+install on demand from the Kilix content catalog. The map of every repository
+and how it ships is on the
+[components page](https://github.com/itsmygithubacct/plebian-os/blob/main/docs/components.md).
 
 ## License
 
